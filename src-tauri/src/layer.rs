@@ -192,3 +192,30 @@ pub fn install_layer() -> Result<LayerStatus, String> {
 
     Ok(get_layer_status())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_stats_written_by_the_layer() {
+        let dir = std::env::temp_dir().join(format!("zyrax-layer-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.json");
+        fs::write(
+            &path,
+            r#"{"enabled":true,"presents":787,"sharpness":0.800,"width":939,"height":1016,"format":97,"pid":123,"timestamp":1700000000}"#,
+        )
+        .unwrap();
+
+        let stats = read_stats(&path).expect("stats should parse");
+        assert!(stats.enabled);
+        assert_eq!(stats.presents, 787);
+        assert!((stats.sharpness - 0.8).abs() < 1e-6);
+        assert_eq!((stats.width, stats.height), (939, 1016));
+        assert_eq!(stats.format, 97);
+        assert_eq!(stats.pid, 123);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}
