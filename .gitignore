@@ -26,3 +26,6 @@ dist-ssr
 # Tauri
 src-tauri/target
 src-tauri/gen
+
+# Vulkan layer build artifacts
+vk-layer/build

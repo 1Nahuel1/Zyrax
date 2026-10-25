@@ -1,0 +1,24 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_ZYRAX_fsr",
+    "type": "GLOBAL",
+    "library_path": "./libzyrax_fsr.so",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "Zyrax FSR-style adaptive sharpening layer",
+    "functions": {
+      "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "vkGetDeviceProcAddr",
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "enable_environment": {
+      "ZYRAX_FSR_ENABLE": "1"
+    },
+    "instance_extensions": [],
+    "device_extensions": [],
+    "disable_environment": {
+      "ZYRAX_FSR_DISABLE": "1"
+    }
+  }
+}

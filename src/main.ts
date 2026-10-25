@@ -5,6 +5,7 @@ import {
   api,
   type DetectedGame,
   type GpuInfo,
+  type LayerStatus,
   type Profile,
   type RuntimeStatus,
 } from "./api";
@@ -18,6 +19,7 @@ interface State {
   profiles: Profile[];
   activeProfileId: string | null;
   runtime: RuntimeStatus;
+  layer: LayerStatus | null;
   selectedPid: number | null;
   scanning: boolean;
   toast: string | null;
@@ -39,6 +41,7 @@ const state: State = {
     injectedAt: null,
     message: "Ready. Select a game to attach Zyrax.",
   },
+  layer: null,
   selectedPid: null,
   scanning: false,
   toast: null,
@@ -464,6 +467,64 @@ function renderProfiles(): string {
   `;
 }
 
+function formatLabel(format: number): string {
+  const map: Record<number, string> = {
+    44: "B8G8R8A8_UNORM",
+    50: "B8G8R8A8_SRGB",
+    97: "R16G16B16A16_SFLOAT",
+  };
+  return map[format] ?? `VkFormat ${format}`;
+}
+
+function renderLayerCard(): string {
+  const layer = state.layer;
+  const shell = (body: string) => `
+      <div class="bg-cyber-panel/60 border border-white/10 p-4">
+        <div class="text-sm text-cyber-cyan mb-2">VULKAN FSR LAYER</div>
+        ${body}
+      </div>`;
+
+  if (!layer) return shell('<div class="text-xs text-gray-400">Checking layer status...</div>');
+
+  const badge = layer.active
+    ? '<span class="text-cyber-green">ACTIVE</span>'
+    : layer.installed
+      ? '<span class="text-cyber-orange">READY</span>'
+      : '<span class="text-cyber-pink">NOT FOUND</span>';
+
+  const stats = layer.stats;
+  const statsHtml = stats
+    ? `<div class="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400">
+         <div>Frames: <span class="text-cyber-cyan">${stats.presents}</span></div>
+         <div>Resolution: <span class="text-cyber-cyan">${stats.width}x${stats.height}</span></div>
+         <div>Sharpness: <span class="text-cyber-cyan">${stats.sharpness.toFixed(2)}</span></div>
+         <div>Format: <span class="text-cyber-cyan">${formatLabel(stats.format)}</span></div>
+         <div>PID: <span class="text-cyber-cyan">${stats.pid}</span></div>
+         <div>Updated: <span class="text-cyber-cyan">${new Date(stats.timestamp * 1000).toLocaleTimeString()}</span></div>
+       </div>`
+    : '<div class="mt-3 text-xs text-gray-500">No frames captured yet. Run a Vulkan game with <span class="text-cyber-cyan">ZYRAX_FSR_ENABLE=1</span>.</div>';
+
+  const paths = layer.sourceDir
+    ? `<div class="mt-2 text-[11px] text-gray-500 break-all">${layer.sourceDir}</div>`
+    : "";
+
+  const installBtn = layer.devBuild
+    ? '<button data-action="install-layer" class="px-3 py-1 border border-cyber-magenta/50 text-cyber-magenta text-xs hover:bg-cyber-magenta/10 hover:shadow-neon-magenta transition-all">INSTALL SYSTEM-WIDE</button>'
+    : "";
+
+  return shell(`
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-xs text-gray-400">${layer.message}</div>
+        <div class="text-xs font-bold shrink-0 ml-3">${badge}</div>
+      </div>
+      ${paths}
+      ${statsHtml}
+      <div class="mt-3 flex flex-wrap gap-2">
+        <button data-action="refresh-layer" class="px-3 py-1 border border-cyber-cyan/50 text-cyber-cyan text-xs hover:bg-cyber-cyan/10 hover:shadow-neon-cyan transition-all">REFRESH</button>
+        ${installBtn}
+      </div>`);
+}
+
 function renderSettings(): string {
   return `
     <h1 class="text-xl font-bold text-gray-300 cyber-glow mb-1">[ SETTINGS ]</h1>
@@ -486,6 +547,7 @@ function renderSettings(): string {
           <div>Hook state: ${state.runtime.state.toUpperCase()}</div>
         </div>
       </div>
+      ${renderLayerCard()}
       <div class="bg-cyber-panel/60 border border-white/10 p-4">
         <div class="text-sm text-cyber-cyan mb-2">LINKS</div>
         <button data-action="open-repo" class="text-xs text-cyber-magenta underline hover:text-cyber-pink">github.com/1Nahuel1/Zyrax</button>
@@ -534,6 +596,7 @@ function render(): void {
         <div class="p-4 border-t border-cyber-cyan/30 text-xs space-y-1">
           <div class="flex items-center gap-2 text-gray-400">${statusDot(state.runtime.state === "active")} HOOK: <span class="text-cyber-cyan">${state.runtime.state.toUpperCase()}</span></div>
           <div class="flex items-center gap-2 text-gray-400">${statusDot(state.gpus.length > 0)} GPU: <span class="text-cyber-cyan">${state.gpus.length > 0 ? "DETECTED" : "NONE"}</span></div>
+          <div class="flex items-center gap-2 text-gray-400">${statusDot(state.layer?.installed ?? false)} LAYER: <span class="text-cyber-cyan">${state.layer?.active ? "ACTIVE" : state.layer?.installed ? "READY" : "NONE"}</span></div>
         </div>
       </aside>
 
@@ -711,6 +774,20 @@ async function handleAction(el: HTMLElement): Promise<void> {
       toast("Profile deleted");
       break;
     }
+    case "refresh-layer": {
+      state.layer = await api.getLayerStatus();
+      toast(state.layer.installed ? "Layer status refreshed" : "Layer not found");
+      break;
+    }
+    case "install-layer": {
+      try {
+        state.layer = await api.installLayer();
+        toast("Layer installed system-wide");
+      } catch (e) {
+        toast(`Install failed: ${e}`);
+      }
+      break;
+    }
     case "open-repo": {
       try {
         await openUrl("https://github.com/1Nahuel1/Zyrax");
@@ -725,15 +802,17 @@ async function handleAction(el: HTMLElement): Promise<void> {
 async function init(): Promise<void> {
   render();
   try {
-    const [data, gpus, runtime] = await Promise.all([
+    const [data, gpus, runtime, layer] = await Promise.all([
       api.getProfiles(),
       api.detectGpu(),
       api.getRuntimeStatus(),
+      api.getLayerStatus(),
     ]);
     state.profiles = data.profiles;
     state.activeProfileId = data.activeProfileId ?? data.profiles[0]?.id ?? null;
     state.gpus = gpus;
     state.runtime = runtime;
+    state.layer = layer;
     render();
   } catch (e) {
     toast(`Init error: ${e}`);

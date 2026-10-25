@@ -45,7 +45,48 @@ The **graphics interception layer** that actually injects FSR/DLSS and
 frame generation into a game's render pipeline is the next milestone. The
 `attach_to_game` command already validates the target process and manages the
 hook lifecycle (`idle → attaching → active`); the rendering hooks plug into
-that lifecycle. See the roadmap below.
+that lifecycle.
+
+On Linux there is a working **Vulkan implicit layer** (see below) that hooks
+`vkQueuePresentKHR` and applies an RCAS-style adaptive sharpening pass on the
+presented image. It is real, testable code — but it is sharpening, not a full
+resolution-changing FSR upscale yet. The app detects the layer and reads live
+frame stats from it in **Settings**.
+
+## Vulkan layer (Linux, alpha)
+
+Requirements: `g++`, `glslangValidator`, `spirv-val`, `xxd` and Vulkan headers.
+
+```bash
+cd vk-layer
+./build.sh          # compiles shaders + libzyrax_fsr.so into vk-layer/build
+./install.sh        # copies it to ~/.local/share/vulkan/implicit_layer.d
+```
+
+Run any Vulkan application with the layer enabled:
+
+```bash
+ZYRAX_FSR_ENABLE=1 ZYRAX_FSR_DEBUG=1 vkcube
+```
+
+For Steam games, set the launch options to `ZYRAX_FSR_ENABLE=1 %command%`.
+
+| Variable | Meaning |
+| --- | --- |
+| `ZYRAX_FSR_ENABLE=1` | Enable the layer (implicit layers are opt-in here). |
+| `ZYRAX_FSR_DISABLE=1` | Force-disable it. |
+| `ZYRAX_FSR_SHARPNESS` | Sharpening strength, `0.0`–`1.0` (default `0.5`). |
+| `ZYRAX_FSR_STATS` | JSON stats path (default `/tmp/zyrax_fsr_stats.json`). |
+| `ZYRAX_FSR_DEBUG=1` | Print layer diagnostics to stderr. |
+
+The layer wraps `vkCreateSwapchainKHR` (adds transfer usage), copies each
+presented image into a scratch image and runs a full-screen RCAS pass back into
+the swapchain image before `vkQueuePresentKHR`. If the swapchain rejects the
+extra usage, the layer transparently falls back to passthrough.
+
+Limitations: no resolution change (no real upscale), no frame generation, and
+it only targets Vulkan swapchains presented on the hooked queue. DXVK/Proton
+games generally work, but this has only been validated with `vkcube` so far.
 
 ## Getting started
 
@@ -77,6 +118,12 @@ src-tauri/src/
   gpu.rs                 # GPU / API detection (Linux + Windows)
   profiles.rs            # profile persistence (JSON in app config dir)
   runtime.rs             # hook lifecycle & runtime status
+  layer.rs               # Vulkan layer discovery, install & live stats
+vk-layer/                # Linux Vulkan implicit layer (C++)
+  src/layer.cpp          # loader interface, swapchain/present hooks, RCAS pass
+  shaders/rcas.*         # full-screen triangle + sharpening shader
+  build.sh               # shader compile + shared library build
+  install.sh             # per-user install into ~/.local/share/vulkan
 ```
 
 ### How upscaling is applied (design)
@@ -96,7 +143,8 @@ src-tauri/src/
 - [x] GPU & graphics API detection
 - [x] Profile management with persistence
 - [x] Runtime hook lifecycle & status
-- [ ] Vulkan implicit layer (Linux) with FSR
+- [x] Vulkan implicit layer (Linux) with RCAS sharpening pass
+- [ ] Resolution-changing FSR upscale in the Vulkan layer
 - [ ] DXGI swapchain hook (Windows) with FSR
 - [ ] DLSS integration
 - [ ] Frame generation pipeline

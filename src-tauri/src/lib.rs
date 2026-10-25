@@ -1,5 +1,6 @@
 mod games;
 mod gpu;
+mod layer;
 mod processes;
 mod profiles;
 mod runtime;
@@ -20,6 +21,8 @@ pub fn run() {
             processes::get_process_stats,
             games::scan_games,
             gpu::detect_gpu,
+            layer::get_layer_status,
+            layer::install_layer,
             profiles::get_profiles,
             profiles::save_profile,
             profiles::delete_profile,

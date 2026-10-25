@@ -42,6 +42,29 @@ export interface AppData {
   activeProfileId: string | null;
 }
 
+export interface LayerStats {
+  enabled: boolean;
+  presents: number;
+  sharpness: number;
+  width: number;
+  height: number;
+  format: number;
+  pid: number;
+  timestamp: number;
+}
+
+export interface LayerStatus {
+  installed: boolean;
+  devBuild: boolean;
+  manifestPath: string | null;
+  libraryPath: string | null;
+  sourceDir: string | null;
+  statsPath: string;
+  stats: LayerStats | null;
+  active: boolean;
+  message: string;
+}
+
 export type HookState = "idle" | "attaching" | "active" | "failed";
 
 export interface RuntimeStatus {
@@ -65,6 +88,8 @@ export const api = {
   setActiveProfile: (id: string | null) =>
     invoke<AppData>("set_active_profile", { id }),
   getRuntimeStatus: () => invoke<RuntimeStatus>("get_runtime_status"),
+  getLayerStatus: () => invoke<LayerStatus>("get_layer_status"),
+  installLayer: () => invoke<LayerStatus>("install_layer"),
   attachToGame: (args: {
     pid: number;
     gameName: string;
