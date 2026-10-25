@@ -114,6 +114,68 @@ fn find_layer() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn control_path() -> PathBuf {
+    std::env::var_os("ZYRAX_FSR_CONTROL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/zyrax_fsr_control"))
+}
+
+/// Write the control file consumed by the Vulkan layer. The layer polls this
+/// file and activates only for the matching PID, so attaching works for a game
+/// that is already running.
+pub fn write_layer_control(
+    pid: u32,
+    enabled: bool,
+    scale_factor: f32,
+    sharpness: f32,
+    overlay: bool,
+    frame_generation: bool,
+) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            pid,
+            enabled,
+            scale_factor,
+            sharpness,
+            overlay,
+            frame_generation,
+        );
+        return Err("The Vulkan layer is only available on Linux".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let path = control_path();
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let scale = scale_factor.clamp(1.0, 4.0);
+        let sharp = sharpness.clamp(0.0, 1.0);
+        let body = format!(
+            "version=1\nenabled={}\npid={}\nscale={:.4}\nsharpness={:.4}\noverlay={}\nframe_gen={}\n",
+            enabled as u8,
+            pid,
+            scale,
+            sharp,
+            overlay as u8,
+            frame_generation as u8
+        );
+        fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// True when the layer has been installed in a system/user implicit-layer
+/// directory (not merely built in the repository).
+pub fn layer_installed_for_games() -> bool {
+    candidate_dirs().iter().any(|dir| {
+        !dir.ends_with("vk-layer/build")
+            && dir.join(MANIFEST_NAME).is_file()
+            && dir.join(LIBRARY_NAME).is_file()
+    })
+}
+
 fn read_stats(path: &Path) -> Option<LayerStats> {
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -146,7 +208,7 @@ pub fn get_layer_status() -> LayerStatus {
                 let message = if dev {
                     "Layer compiled in the repository. Install it to enable it system-wide."
                 } else {
-                    "Layer installed. Launch a Vulkan game with ZYRAX_FSR_ENABLE=1."
+                    "Layer installed. Attach a running Vulkan game from the dashboard."
                 };
                 (
                     true,
@@ -208,6 +270,31 @@ pub fn install_layer() -> Result<LayerStatus, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writes_control_file_for_the_layer() {
+        let dir = std::env::temp_dir().join(format!("zyrax-control-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control");
+        std::env::set_var("ZYRAX_FSR_CONTROL", &path);
+
+        write_layer_control(4242, true, 1.75, 0.65, true, false).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("enabled=1"));
+        assert!(body.contains("pid=4242"));
+        assert!(body.contains("scale=1.7500"));
+        assert!(body.contains("sharpness=0.6500"));
+        assert!(body.contains("overlay=1"));
+        assert!(body.contains("frame_gen=0"));
+
+        write_layer_control(4242, false, 1.0, 0.0, false, false).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("enabled=0"));
+
+        std::env::remove_var("ZYRAX_FSR_CONTROL");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_stats_written_by_the_layer() {

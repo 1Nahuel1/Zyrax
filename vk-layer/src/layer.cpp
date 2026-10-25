@@ -9,11 +9,17 @@
 // a scratch image and reconstructed to full resolution with EASU + RCAS before
 // the normal present call. No second swapchain or extra acquire is required.
 //
-// Enabled only when ZYRAX_FSR_ENABLE=1 is set (see VkLayer_zyrax_fsr.json).
+// The implicit layer is loaded by every Vulkan process once installed, but it
+// only activates for the PID named in the control file written by the Zyrax
+// app (or for every process when ZYRAX_FSR_ENABLE=1 is set manually).
+//
 // Environment variables:
+//   ZYRAX_FSR_ENABLE      force-enable for this process (manual mode)
 //   ZYRAX_FSR_SCALE       render scale (default 1.5, 1.0 disables upscaling)
 //   ZYRAX_FSR_SHARPNESS   0.0 .. 1.0   (default 0.5)
-//   ZYRAX_FSR_DISABLE     set to 1 to hard-disable
+//   ZYRAX_FSR_DISABLE     set to 1 to hard-disable the hooks
+//   ZYRAX_FSR_CONTROL     control file path
+//                          (default /tmp/zyrax_fsr_control)
 //   ZYRAX_FSR_DEBUG       set to 1 for stderr logging
 //   ZYRAX_FSR_STATS       stats output path
 //                          (default /tmp/zyrax_fsr_stats.json)
@@ -77,12 +83,9 @@ static PFN_vkGetDeviceProcAddr loaderGDPA() {
 static PFN_vkGetInstanceProcAddr chainGIPA() { return g_nextGIPA ? g_nextGIPA : loaderGIPA(); }
 static PFN_vkGetDeviceProcAddr chainGDPA() { return g_nextGDPA ? g_nextGDPA : loaderGDPA(); }
 
-static bool layerEnabled() {
+static bool hooksEnabled() {
     const char* dis = getenv("ZYRAX_FSR_DISABLE");
-    if (dis && dis[0] == '1') return false;
-    const char* en = getenv("ZYRAX_FSR_ENABLE");
-    if (en && en[0] == '0') return false;
-    return true;
+    return !(dis && dis[0] == '1');
 }
 
 static bool debugEnabled() {
@@ -99,31 +102,6 @@ static bool debugEnabled() {
         }                                    \
     } while (0)
 
-static float readScale() {
-    const char* s = getenv("ZYRAX_FSR_SCALE");
-    float v = s ? (float)atof(s) : 1.5f;
-    if (!std::isfinite(v)) v = 1.5f;
-    if (v < 1.0f) v = 1.0f;
-    if (v > 4.0f) v = 4.0f;
-    return v;
-}
-
-static bool upscaleEnabled() { return layerEnabled() && readScale() > 1.001f; }
-
-static float readSharpness() {
-    const char* s = getenv("ZYRAX_FSR_SHARPNESS");
-    float v = s ? (float)atof(s) : 0.5f;
-    if (!std::isfinite(v)) v = 0.5f;
-    if (v < 0.0f) v = 0.0f;
-    if (v > 1.0f) v = 1.0f;
-    return v;
-}
-
-static const char* statsPath() {
-    const char* p = getenv("ZYRAX_FSR_STATS");
-    return p && p[0] ? p : "/tmp/zyrax_fsr_stats.json";
-}
-
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -134,6 +112,7 @@ struct PushConstants {
     uint32_t con2[4];
     uint32_t con3[4];
     uint32_t rcas[4];
+    uint32_t ui[4];
 };
 
 struct QueueState {
@@ -150,6 +129,7 @@ struct QueueState {
 struct SurfaceState {
     bool learned = false;
     bool disabled = false;
+    bool restore = false;
     VkExtent2D outputExtent{0, 0};
     uint32_t recreateAttempts = 0;
     uint32_t recreateBurst = 0;
@@ -190,6 +170,8 @@ struct SwapchainState {
 struct DeviceState {
     VkPhysicalDevice gpu = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+    uint64_t controlSerial = 0;
+    bool activeLast = false;
 
     PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
     PFN_vkDestroySwapchainKHR DestroySwapchainKHR = nullptr;
@@ -260,6 +242,9 @@ struct DeviceState {
 
     float sharpness = 0.5f;
     uint64_t presents = 0;
+    uint32_t fpsFrames = 0;
+    float fps = 0.0f;
+    double fpsStart = 0.0;
     double lastStatsWrite = 0.0;
 
     std::unordered_map<VkQueue, QueueState> queues;
@@ -284,6 +269,126 @@ static double nowSeconds() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+struct ControlState {
+    bool enabled = false;
+    long pid = -1;
+    float scale = 1.5f;
+    float sharpness = 0.5f;
+    bool overlay = false;
+    bool frameGen = false;
+    uint64_t serial = 0;
+    double lastRead = -1.0;
+};
+static ControlState g_control;
+static std::mutex g_controlMutex;
+
+static const char* controlPath() {
+    const char* p = getenv("ZYRAX_FSR_CONTROL");
+    return p && p[0] ? p : "/tmp/zyrax_fsr_control";
+}
+
+static const char* statsPath() {
+    const char* p = getenv("ZYRAX_FSR_STATS");
+    return p && p[0] ? p : "/tmp/zyrax_fsr_stats.json";
+}
+
+static char* trimInPlace(char* s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') ++s;
+    char* end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n'))
+        *--end = 0;
+    return s;
+}
+
+static void refreshControl() {
+    std::lock_guard<std::mutex> lk(g_controlMutex);
+    double now = nowSeconds();
+    if (now - g_control.lastRead < 0.25) return;
+
+    ControlState c;
+    c.serial = g_control.serial;
+    c.lastRead = now;
+    FILE* f = fopen(controlPath(), "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            char* hash = strchr(line, '#');
+            if (hash) *hash = 0;
+            char* eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            char* key = trimInPlace(line);
+            char* value = trimInPlace(eq + 1);
+            if (!strcmp(key, "enabled")) c.enabled = atoi(value) != 0;
+            else if (!strcmp(key, "pid")) c.pid = atol(value);
+            else if (!strcmp(key, "scale")) c.scale = (float)atof(value);
+            else if (!strcmp(key, "sharpness")) c.sharpness = (float)atof(value);
+            else if (!strcmp(key, "overlay")) c.overlay = atoi(value) != 0;
+            else if (!strcmp(key, "frame_gen")) c.frameGen = atoi(value) != 0;
+        }
+        fclose(f);
+    }
+    if (!std::isfinite(c.scale)) c.scale = 1.5f;
+    c.scale = std::clamp(c.scale, 1.0f, 4.0f);
+    if (!std::isfinite(c.sharpness)) c.sharpness = 0.5f;
+    c.sharpness = std::clamp(c.sharpness, 0.0f, 1.0f);
+
+    bool pipelineChanged = c.enabled != g_control.enabled || c.pid != g_control.pid ||
+                           fabsf(c.scale - g_control.scale) > 1e-4f ||
+                           fabsf(c.sharpness - g_control.sharpness) > 1e-4f;
+    bool anyChanged = pipelineChanged || c.overlay != g_control.overlay ||
+                      c.frameGen != g_control.frameGen;
+    if (pipelineChanged) ++c.serial;
+    if (anyChanged) {
+        g_control = c;
+    } else {
+        g_control.lastRead = now;
+    }
+}
+
+static ControlState snapshotControl() {
+    refreshControl();
+    std::lock_guard<std::mutex> lk(g_controlMutex);
+    return g_control;
+}
+
+static bool processActiveFor(const ControlState& c) {
+    if (!hooksEnabled()) return false;
+    const char* en = getenv("ZYRAX_FSR_ENABLE");
+    if (en && en[0] == '1') return true;
+    return c.enabled && c.pid > 0 && (long)getpid() == c.pid;
+}
+
+static bool processActive() { return processActiveFor(snapshotControl()); }
+
+static float readScale() {
+    const char* s = getenv("ZYRAX_FSR_SCALE");
+    if (s && s[0]) {
+        float v = (float)atof(s);
+        if (!std::isfinite(v)) v = 1.5f;
+        return std::clamp(v, 1.0f, 4.0f);
+    }
+    return std::clamp(snapshotControl().scale, 1.0f, 4.0f);
+}
+
+static float readSharpness() {
+    const char* s = getenv("ZYRAX_FSR_SHARPNESS");
+    if (s && s[0]) {
+        float v = (float)atof(s);
+        if (!std::isfinite(v)) v = 0.5f;
+        return std::clamp(v, 0.0f, 1.0f);
+    }
+    return std::clamp(snapshotControl().sharpness, 0.0f, 1.0f);
+}
+
+static bool upscaleEnabled() { return processActive() && readScale() > 1.001f; }
+
+static bool overlayEnabled() {
+    const char* e = getenv("ZYRAX_FSR_OVERLAY");
+    if (e && e[0] == '1') return true;
+    return snapshotControl().overlay;
 }
 
 // ---------------------------------------------------------------------------
@@ -752,7 +857,10 @@ static void processFrame(DeviceState* ds, SwapchainState* sc, VkQueue queue, uin
             // Never leave the application rendering a reduced region into a
             // full-size swapchain. Disable FSR for this surface and ask for a
             // single recreate at the native size after the present.
-            if (sc->surface) g_surfaces[sc->surface].disabled = true;
+            if (sc->surface) {
+                g_surfaces[sc->surface].disabled = true;
+                g_surfaces[sc->surface].restore = true;
+            }
             sc->enabled = false;
             sc->forceRecreate = true;
             ZLOG("disabling FSR after resource failure");
@@ -761,6 +869,11 @@ static void processFrame(DeviceState* ds, SwapchainState* sc, VkQueue queue, uin
     }
     QueueState* qs = ensureQueue(ds, queue);
     if (!qs) return;
+
+    sc->pc.ui[0] = overlayEnabled() ? 1u : 0u;
+    sc->pc.ui[1] = (uint32_t)(ds->fps + 0.5f);
+    sc->pc.ui[2] = (uint32_t)(readScale() * 100.0f + 0.5f);
+    sc->pc.ui[3] = sc->extent.height;
 
     VkImage swImg = sc->images[index];
     VkFramebuffer fb = sc->framebuffers[index];
@@ -901,31 +1014,66 @@ static bool extentNear(VkExtent2D a, VkExtent2D b) {
     return dw <= 2 && dh <= 2;
 }
 
+// Wayland reports currentExtent=UINT32_MAX and applications remember the last
+// concrete extent they saw. After detach (or when FSR turns itself off) that
+// remembered extent is the reduced one, so report the learned output size once
+// more. Otherwise the game window would stay at the smaller size.
+static void reportFullExtent(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* caps) {
+    if (caps->currentExtent.width != UINT32_MAX) return;
+    VkExtent2D output{};
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_surfaces.find(surface);
+        if (it == g_surfaces.end() || !it->second.learned || !it->second.restore) return;
+        output = it->second.outputExtent;
+    }
+    caps->minImageExtent = {1, 1};
+    if (caps->maxImageExtent.width < output.width) caps->maxImageExtent.width = output.width;
+    if (caps->maxImageExtent.height < output.height) caps->maxImageExtent.height = output.height;
+    caps->currentExtent = output;
+    ZLOG("caps hook: restore full output %ux%u", output.width, output.height);
+}
+
 static void applyUpscaleExtent(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* caps) {
     ZLOG("caps hook: current=%ux%u min=%ux%u max=%ux%u scale=%.2f up=%d", caps->currentExtent.width,
          caps->currentExtent.height, caps->minImageExtent.width, caps->minImageExtent.height,
          caps->maxImageExtent.width, caps->maxImageExtent.height, (double)readScale(),
          (int)upscaleEnabled());
-    if (!layerEnabled()) return;
-    if (!(caps->supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
-        ZLOG("caps hook: surface cannot be a transfer source, not reducing");
+    if (!processActive()) {
+        reportFullExtent(surface, caps);
         return;
     }
-    if (!upscaleEnabled()) return;
+    if (!(caps->supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        ZLOG("caps hook: surface cannot be a transfer source, not reducing");
+        reportFullExtent(surface, caps);
+        return;
+    }
+    if (!upscaleEnabled()) {
+        reportFullExtent(surface, caps);
+        return;
+    }
 
     VkExtent2D output = caps->currentExtent;
+    bool disabled = false;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         auto it = g_surfaces.find(surface);
-        if (it != g_surfaces.end() && it->second.disabled) return;
-        if (output.width == UINT32_MAX || output.height == UINT32_MAX) {
+        disabled = it != g_surfaces.end() && it->second.disabled;
+        if (!disabled && (output.width == UINT32_MAX || output.height == UINT32_MAX)) {
             if (it == g_surfaces.end() || !it->second.learned) return;
             output = it->second.outputExtent;
         }
     }
+    if (disabled) {
+        reportFullExtent(surface, caps);
+        return;
+    }
 
     VkExtent2D lower = reducedExtent(output, readScale());
-    if (lower.width >= output.width || lower.height >= output.height) return;
+    if (lower.width >= output.width || lower.height >= output.height) {
+        reportFullExtent(surface, caps);
+        return;
+    }
 
     // Report a smaller surface so the application renders fewer pixels. The
     // real swapchain is still created at the true size in vkCreateSwapchainKHR.
@@ -1094,15 +1242,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice gpu, co
     g_nextGDPA = fpGDPA;
     g_nextGIPA = fpGIPA;
 
-    if (!layerEnabled()) {
-        ZLOG("layer disabled by environment");
+    if (!hooksEnabled()) {
+        ZLOG("layer hooks disabled by environment");
         return VK_SUCCESS;
     }
 
+    ControlState initial = snapshotControl();
     auto* ds = new DeviceState();
     ds->gpu = gpu;
     ds->device = *pDevice;
     ds->sharpness = readSharpness();
+    ds->controlSerial = initial.serial;
+    ds->fpsStart = nowSeconds();
 
 #define LOAD(n) ds->n = (PFN_vk##n)fpGDPA(*pDevice, "vk" #n)
     LOAD(CreateSwapchainKHR);
@@ -1194,7 +1345,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
                                                               const VkAllocationCallbacks* pAllocator,
                                                               VkSwapchainKHR* pSwapchain) {
     DeviceState* ds = deviceFor(device);
-    if (!ds || !layerEnabled()) {
+    if (!ds) {
         auto gdpa = chainGDPA();
         if (!gdpa) return VK_ERROR_INITIALIZATION_FAILED;
         auto fp = (PFN_vkCreateSwapchainKHR)gdpa(device, "vkCreateSwapchainKHR");
@@ -1223,8 +1374,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         formatOk = (fp.optimalTilingFeatures & need) == need;
     }
-    bool canProcess = layerEnabled() && capsTransfer && usageColor && formatOk;
-    if (!canProcess) {
+    bool active = processActive();
+    bool canProcess = active && capsTransfer && usageColor && formatOk;
+    if (!canProcess && active) {
         ZLOG("swapchain cannot use FSR (transfer=%d color=%d format=%d)", (int)capsTransfer,
              (int)usageColor, (int)formatOk);
         bool wasReduced = false;
@@ -1238,6 +1390,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
             SurfaceState& st = g_surfaces[pCreateInfo->surface];
             newlyDisabled = !st.disabled;
             st.disabled = true;
+            st.restore = true;
             if (!concrete && st.learned) {
                 outputExtent = st.outputExtent;
                 wasReduced = extentNear(renderExtent, reducedExtent(st.outputExtent, readScale()));
@@ -1266,6 +1419,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
                         forceRecreate = true;
                     } else {
                         st.disabled = true;
+                        st.restore = true;
                         ZLOG("wayland: too many recreate requests, disabling upscale");
                     }
                 };
@@ -1283,7 +1437,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
                     st.recreateAttempts = 0;
                 } else if (extentNear(renderExtent, st.outputExtent)) {
                     st.recreateAttempts++;
-                    if (st.recreateAttempts >= 2) st.disabled = true;
+                    if (st.recreateAttempts >= 2) {
+                        st.disabled = true;
+                        st.restore = true;
+                    }
                     ZLOG("wayland: app ignored reduced extent, rendering full size (attempt %u)",
                          st.recreateAttempts);
                 } else if (st.recreateAttempts < 2) {
@@ -1295,9 +1452,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
                          expectedRender.height);
                 } else {
                     st.disabled = true;
+                    st.restore = true;
                     ZLOG("wayland: disabling upscale, app keeps its own extent");
                 }
             }
+        }
+    }
+
+    if (!concrete) {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        SurfaceState& st = g_surfaces[pCreateInfo->surface];
+        if (!active) {
+            VkExtent2D expected =
+                st.learned ? reducedExtent(st.outputExtent, readScale()) : VkExtent2D{};
+            if (!st.learned || !st.restore ||
+                (!extentNear(renderExtent, expected) &&
+                 !extentNear(renderExtent, st.outputExtent))) {
+                st.outputExtent = renderExtent;
+                st.learned = true;
+                ZLOG("wayland: tracking output %ux%u while inactive", st.outputExtent.width,
+                     st.outputExtent.height);
+            }
+        }
+        if (st.learned) {
+            bool reachedFull = extentNear(renderExtent, st.outputExtent);
+            bool reducedActive = active && canProcess && upscale;
+            if (reachedFull || reducedActive) st.restore = false;
         }
     }
 
@@ -1315,6 +1495,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
     VkExtent2D createdExtent = ci.imageExtent;
     VkResult res = ds->CreateSwapchainKHR(device, &ci, pAllocator, pSwapchain);
     bool enabled = canProcess;
+    if (res != VK_SUCCESS && !active) return res;
     if (res != VK_SUCCESS) {
         // The driver rejected the extra usage or the reduced/full extent. Try the
         // application's original extent without touching imageUsage first.
@@ -1334,6 +1515,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
         {
             std::lock_guard<std::mutex> lk(g_mutex);
             g_surfaces[pCreateInfo->surface].disabled = true;
+            g_surfaces[pCreateInfo->surface].restore = true;
         }
         ZLOG("swapchain rejected FSR usage; passthrough and one recreate");
     }
@@ -1346,7 +1528,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
     sc.renderExtent.width = std::min(sc.renderExtent.width, sc.extent.width);
     sc.renderExtent.height = std::min(sc.renderExtent.height, sc.extent.height);
     sc.upscale = upscale && enabled;
-    sc.enabled = enabled && layerEnabled();
+    sc.enabled = enabled && active;
     sc.forceRecreate = forceRecreate;
 
     uint32_t count = 0;
@@ -1382,21 +1564,73 @@ static VKAPI_ATTR void VKAPI_CALL LayerDestroySwapchainKHR(VkDevice device, VkSw
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL LayerQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
+    ControlState ctl = snapshotControl();
+    bool active = processActiveFor(ctl);
+
     DeviceState* ds = nullptr;
     {
         auto it = g_queueDevice.find(queue);
         if (it != g_queueDevice.end()) ds = it->second;
     }
 
-    if (ds && layerEnabled()) {
+    if (ds) {
         std::lock_guard<std::mutex> lk(g_mutex);
-        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
-            auto it = ds->swapchains.find(pPresentInfo->pSwapchains[i]);
-            if (it != ds->swapchains.end() && it->second.enabled) {
-                processFrame(ds, &it->second, queue, pPresentInfo->pImageIndices[i]);
+        bool configChanged = ds->controlSerial != ctl.serial;
+        if (configChanged) {
+            ds->controlSerial = ctl.serial;
+            // Only the process being attached or detached needs a recreate;
+            // unrelated games that merely loaded the implicit layer stay
+            // passthrough without a hitch.
+            if (active || ds->activeLast) {
+                for (auto& kv : ds->swapchains) kv.second.forceRecreate = true;
+            }
+            if (active) {
+                for (auto& kv : g_surfaces) kv.second.disabled = false;
+                if (readScale() <= 1.001f) {
+                    for (auto& kv : g_surfaces) kv.second.restore = true;
+                }
+            } else {
+                // Detach now, before the recreate completes: stop processing
+                // frames immediately and ask the app for a full-size swapchain.
+                for (auto& kv : ds->swapchains) {
+                    if (kv.second.enabled) {
+                        kv.second.enabled = false;
+                        kv.second.forceRecreate = true;
+                        if (kv.second.surface) g_surfaces[kv.second.surface].restore = true;
+                    }
+                }
             }
         }
-        writeStats(ds);
+        if (active && !ds->activeLast) {
+            ds->fpsFrames = 0;
+            ds->fps = 0.0f;
+            ds->fpsStart = nowSeconds();
+        }
+        ds->activeLast = active;
+        if (active) {
+            ds->sharpness = readSharpness();
+            ds->fpsFrames++;
+            double now = nowSeconds();
+            double elapsed = now - ds->fpsStart;
+            if (elapsed >= 1.0) {
+                ds->fps = (float)(ds->fpsFrames / elapsed);
+                ds->fpsFrames = 0;
+                ds->fpsStart = now;
+            }
+        }
+
+        bool anyEnabled = false;
+        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+            auto it = ds->swapchains.find(pPresentInfo->pSwapchains[i]);
+            if (it == ds->swapchains.end()) continue;
+            SwapchainState& sc = it->second;
+            if (sc.enabled) {
+                anyEnabled = true;
+                processFrame(ds, &sc, queue, pPresentInfo->pImageIndices[i]);
+            }
+        }
+        if (active || anyEnabled || (ctl.pid > 0 && (long)getpid() == ctl.pid))
+            writeStats(ds);
     }
 
     if (!ds || !ds->QueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
@@ -1404,7 +1638,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerQueuePresentKHR(VkQueue queue, const 
     if (res != VK_SUCCESS) ZLOG("present result=%d", (int)res);
 
     bool recreate = false;
-    if (layerEnabled()) {
+    if (ds) {
         std::lock_guard<std::mutex> lk(g_mutex);
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
             auto it = ds->swapchains.find(pPresentInfo->pSwapchains[i]);
@@ -1415,7 +1649,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerQueuePresentKHR(VkQueue queue, const 
         }
     }
     if (recreate && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
-        ZLOG("wayland: returning OUT_OF_DATE so the app recreates at the reduced size");
+        ZLOG("returning OUT_OF_DATE (active=%d)", (int)active);
         return VK_ERROR_OUT_OF_DATE_KHR;
     }
     return res;

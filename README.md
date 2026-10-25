@@ -19,10 +19,12 @@ cyberpunk UI built with Tauri + Rust and a Vite/TypeScript frontend.
   Proton/Wine titles by executable path heuristics.
 - **GPU detection** — enumerates GPUs, driver and supported graphics APIs
   (Vulkan, OpenGL, DirectX 11/12, FSR/DLSS).
-- **Upscaling profiles** — choose FSR / DLSS / Off, scale factor and sharpness.
-- **Frame generation** — toggle synthetic frame interpolation and pick a
-  multiplier (2x / 3x / 4x).
-- **Cyberpunk overlay** — configurable overlay with a toggle hotkey.
+- **Upscaling profiles** — choose FSR / DLSS / Off, scale factor and sharpness
+  (FSR is the only backend implemented today).
+- **Frame generation** — UI and profile plumbing are in place (the Linux layer
+  does not synthesize frames yet).
+- **In-game overlay** — optional 5x7 HUD drawn by the FSR shader with live FPS
+  and active scale.
 - **Profile manager** — create, activate and delete per-game configuration
   profiles (persisted to disk).
 - **Cross-platform shell** — Windows and Linux via Tauri 2.
@@ -41,17 +43,16 @@ cyberpunk UI built with Tauri + Rust and a Vite/TypeScript frontend.
 This is an **alpha**. The application shell, game/GPU detection, profile
 management, persistence and the full cyberpunk UI are implemented and working.
 
-The **graphics interception layer** that injects FSR and frame generation into
-a game's render pipeline is under active development. The `attach_to_game`
-command already validates the target process and manages the hook lifecycle
-(`idle → attaching → active`); the rendering hooks plug into that lifecycle.
-
 On Linux there is a working **Vulkan implicit layer** (see below) that performs
 a real, resolution-changing **FSR 1.0** upscale: the game is told to render at
 `1 / scale` of the surface, then the layer runs **EASU** (edge-adaptive spatial
 upscaling) followed by **RCAS** (robust contrast adaptive sharpening) up to the
-full output size. The app detects the layer and reads live frame stats from it
-in **Settings**.
+full output size. The app detects the layer, attaches to a running Vulkan
+process through a small control file, pushes scale/sharpness changes live, and
+reads frame stats from it in **Settings**.
+
+The Windows DXGI hook, DLSS and real frame generation are **not implemented**
+yet. The layer only targets Vulkan on Linux.
 
 ## Vulkan layer (Linux, alpha)
 
@@ -63,22 +64,33 @@ cd vk-layer
 ./install.sh        # copies it to ~/.local/share/vulkan/implicit_layer.d
 ```
 
-Run any Vulkan application with the layer enabled:
+The layer is installed **globally** as an implicit layer, but it stays in
+passthrough until Zyrax attaches to a process. Start the game first, then press
+**Attach** in the dashboard. Changes to scale/sharpness and detach apply live.
+The layer must already be installed when the game starts; restart the game if
+you installed it afterwards.
+
+Manual use without the app (the layer reads this same state):
 
 ```bash
 ZYRAX_FSR_ENABLE=1 ZYRAX_FSR_DEBUG=1 vkcube
+ZYRAX_FSR_OVERLAY=1 ZYRAX_FSR_ENABLE=1 vkcube   # with FPS/scale HUD
 ```
-
-For Steam games, set the launch options to `ZYRAX_FSR_ENABLE=1 %command%`.
 
 | Variable | Meaning |
 | --- | --- |
-| `ZYRAX_FSR_ENABLE=1` | Enable the layer (implicit layers are opt-in here). |
-| `ZYRAX_FSR_DISABLE=1` | Force-disable it. |
+| `ZYRAX_FSR_ENABLE=1` | Activate FSR for this process without the app. |
+| `ZYRAX_FSR_DISABLE=1` | Force-disable the layer in this process. |
 | `ZYRAX_FSR_SCALE` | FSR scale factor `1.0`–`4.0` (default `1.5`). `1.0` = sharpening only. |
 | `ZYRAX_FSR_SHARPNESS` | RCAS sharpening strength, `0.0`–`1.0` (default `0.5`). |
+| `ZYRAX_FSR_OVERLAY=1` | Draw the in-game FPS/scale HUD. |
+| `ZYRAX_FSR_CONTROL` | Control file path (default `/tmp/zyrax_fsr_control`). |
 | `ZYRAX_FSR_STATS` | JSON stats path (default `/tmp/zyrax_fsr_stats.json`). |
 | `ZYRAX_FSR_DEBUG=1` | Print layer diagnostics to stderr. |
+
+The app writes the control file atomically (`version`, `enabled`, `pid`,
+`scale`, `sharpness`, `overlay`, `frame_gen`); the layer re-reads it every
+250 ms.
 
 How it works:
 
@@ -94,17 +106,24 @@ How it works:
    from the first swapchain and requests a single
    `VK_ERROR_OUT_OF_DATE_KHR` recreate so the app switches to the reduced
    extent.
-5. If the swapchain cannot be sampled as a transfer source, lacks the required
+5. Attach/detach and pipeline changes (scale, sharpness, PID) trigger one
+   recreate. Overlay toggles and FPS updates use push constants only. On
+   detach the layer reports the learned full output size again so the window
+   does not stay shrunk.
+6. If the swapchain cannot be sampled as a transfer source, lacks the required
    format features, or resource creation fails, the layer disables FSR for that
    surface, presents in passthrough and requests one recreate at the native
    size.
 
 Limitations: no frame generation; only Vulkan swapchains presented on the
-hooked queue; swapchain alpha is not preserved (output is opaque); on Wayland,
-resizing the window after startup may keep the original internal output
-resolution until the app recreates with a new size.
+hooked queue; no semaphore synchronization with the application queue (frames
+are copied after an internal wait, so multi-queue engines may tear); swapchain
+alpha is not preserved (output is opaque); on Wayland, resizing the window after
+startup may keep the original internal output resolution until the app recreates
+with a new size.
 Validated with `vkcube` on RADV under Wayland and X11, with the broken
-`VK_LAYER_LSFGVK_frame_generation` implicit layer and other overlays disabled.
+`VK_LAYER_LSFGVK_frame_generation` implicit layer and other overlays disabled,
+including live attach, scale/sharpness changes, HUD toggle and detach.
 DXVK games should work but have not been exhaustively tested.
 
 ## Getting started
@@ -166,8 +185,8 @@ vk-layer/                # Linux Vulkan implicit layer (C++)
 - [ ] DXGI swapchain hook (Windows) with FSR
 - [ ] DLSS integration
 - [ ] Frame generation pipeline
-- [ ] In-game overlay renderer
-- [ ] Global hotkey registration
+- [x] In-game FPS/scale HUD (drawn by the FSR shader)
+- [ ] Configurable overlay elements and global hotkeys
 
 ## Contributing
 

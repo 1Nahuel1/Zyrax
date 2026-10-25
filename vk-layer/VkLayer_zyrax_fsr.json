@@ -6,14 +6,11 @@
     "library_path": "./libzyrax_fsr.so",
     "api_version": "1.4.0",
     "implementation_version": "1",
-    "description": "Zyrax FSR 1.0 EASU + RCAS upscaling layer",
+    "description": "Zyrax FSR 1.0 EASU + RCAS upscaling layer (control-file activated)",
     "functions": {
       "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
       "vkGetDeviceProcAddr": "vkGetDeviceProcAddr",
       "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
-    },
-    "enable_environment": {
-      "ZYRAX_FSR_ENABLE": "1"
     },
     "instance_extensions": [],
     "device_extensions": [],

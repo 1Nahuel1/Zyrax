@@ -76,6 +76,8 @@ export interface RuntimeStatus {
   pid: number | null;
   gameName: string | null;
   upscaler: string | null;
+  scaleFactor: number;
+  sharpness: number;
   frameGeneration: boolean;
   overlayEnabled: boolean;
   injectedAt: number | null;
@@ -98,6 +100,8 @@ export const api = {
     pid: number;
     gameName: string;
     upscaler: string;
+    scaleFactor: number;
+    sharpness: number;
     frameGeneration: boolean;
     overlayEnabled: boolean;
   }) => invoke<RuntimeStatus>("attach_to_game", args),

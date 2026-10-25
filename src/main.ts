@@ -36,6 +36,8 @@ const state: State = {
     pid: null,
     gameName: null,
     upscaler: null,
+    scaleFactor: 1.5,
+    sharpness: 0.5,
     frameGeneration: false,
     overlayEnabled: false,
     injectedAt: null,
@@ -299,6 +301,14 @@ function renderUpscaling(): string {
           .join("")}
       </div>
 
+      ${
+        p.upscaler !== "fsr"
+          ? `<div class="text-[11px] text-cyber-orange border border-cyber-orange/30 bg-cyber-orange/5 px-3 py-2 mb-3">
+               Only FSR is implemented by the Linux Vulkan layer. Select FSR to attach.
+             </div>`
+          : ""
+      }
+
       <div class="bg-cyber-panel/60 border border-cyber-cyan/30 p-5 space-y-6">
         <div>
           <div class="flex justify-between text-sm mb-2">
@@ -333,6 +343,9 @@ function renderFramegen(): string {
       !p
         ? `<div class="text-sm text-gray-500">Create a profile first.</div>`
         : `
+      <div class="text-[11px] text-cyber-orange border border-cyber-orange/30 bg-cyber-orange/5 px-3 py-2 mb-3">
+        The Linux Vulkan layer does not synthesize frames yet; profiles only store this preference.
+      </div>
       <div class="bg-cyber-panel/60 border border-cyber-magenta/40 p-5 mb-4">
         <div class="flex items-center justify-between">
           <div>
@@ -392,7 +405,7 @@ function renderOverlay(): string {
         <div class="flex items-center justify-between">
           <div>
             <div class="text-sm text-white">IN-GAME OVERLAY</div>
-            <div class="text-xs text-gray-400 mt-1">Renders HUD with FPS, upscaler and framegen status.</div>
+            <div class="text-xs text-gray-400 mt-1">Draws an FPS and scale HUD with the FSR shader.</div>
           </div>
           <button data-action="toggle-overlay" class="w-14 h-7 border ${
             p.overlayEnabled
@@ -411,7 +424,7 @@ function renderOverlay(): string {
         <div class="flex items-center gap-3">
           <input data-action="hotkey" value="${p.hotkeyToggle}" maxlength="12"
             class="bg-black/40 border border-cyber-cyan/40 text-cyber-cyan px-3 py-2 text-sm w-40 outline-none focus:border-cyber-cyan" />
-          <span class="text-[11px] text-gray-500">Press the overlay hotkey in-game to show/hide.</span>
+          <span class="text-[11px] text-gray-500">Global hotkey registration is not implemented yet; use this toggle.</span>
         </div>
       </div>
     `
@@ -493,7 +506,7 @@ function renderLayerCard(): string {
       : '<span class="text-cyber-pink">NOT FOUND</span>';
 
   const stats = layer.stats;
-  const statsHtml = stats
+  const statsHtml = stats && stats.enabled
     ? `<div class="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400">
          <div>Frames: <span class="text-cyber-cyan">${stats.presents}</span></div>
          <div>Output: <span class="text-cyber-cyan">${stats.width}x${stats.height}</span></div>
@@ -504,7 +517,7 @@ function renderLayerCard(): string {
          <div>PID: <span class="text-cyber-cyan">${stats.pid}</span></div>
          <div>Updated: <span class="text-cyber-cyan">${new Date(stats.timestamp * 1000).toLocaleTimeString()}</span></div>
        </div>`
-    : '<div class="mt-3 text-xs text-gray-500">No frames captured yet. Run a Vulkan game with <span class="text-cyber-cyan">ZYRAX_FSR_ENABLE=1</span>.</div>';
+    : '<div class="mt-3 text-xs text-gray-500">No active attachment. Launch a Vulkan game, then attach it from the dashboard.</div>';
 
   const paths = layer.sourceDir
     ? `<div class="mt-2 text-[11px] text-gray-500 break-all">${layer.sourceDir}</div>`
@@ -644,6 +657,37 @@ function bindEvents(): void {
   hotkey?.addEventListener("change", () => handleAction(hotkey));
 }
 
+let syncTimer: number | null = null;
+
+async function syncRuntimeProfile(): Promise<void> {
+  const p = activeProfile();
+  if (!p || state.runtime.state !== "active" || state.runtime.pid == null) return;
+  try {
+    state.runtime = await api.attachToGame({
+      pid: state.runtime.pid,
+      gameName: state.runtime.gameName ?? "Running game",
+      upscaler: p.upscaler,
+      scaleFactor: p.scaleFactor,
+      sharpness: p.sharpness,
+      frameGeneration: p.frameGeneration,
+      overlayEnabled: p.overlayEnabled,
+    });
+    if (state.runtime.state === "failed") toast(state.runtime.message);
+    render();
+  } catch (e) {
+    toast(`Layer update failed: ${e}`);
+  }
+}
+
+function scheduleRuntimeSync(): void {
+  if (state.runtime.state !== "active" || state.runtime.pid == null) return;
+  if (syncTimer != null) window.clearTimeout(syncTimer);
+  syncTimer = window.setTimeout(() => {
+    syncTimer = null;
+    void syncRuntimeProfile();
+  }, 350);
+}
+
 async function persistActive(mutate: (p: Profile) => void) {
   const p = activeProfile();
   if (!p) return;
@@ -652,6 +696,7 @@ async function persistActive(mutate: (p: Profile) => void) {
   state.profiles = data.profiles;
   state.activeProfileId = data.activeProfileId;
   render();
+  scheduleRuntimeSync();
 }
 
 async function handleAction(el: HTMLElement): Promise<void> {
@@ -698,10 +743,13 @@ async function handleAction(el: HTMLElement): Promise<void> {
           pid: game.pid,
           gameName: game.name,
           upscaler: p.upscaler,
+          scaleFactor: p.scaleFactor,
+          sharpness: p.sharpness,
           frameGeneration: p.frameGeneration,
           overlayEnabled: p.overlayEnabled,
         });
-        toast(`Applied to ${game.name}`);
+        if (state.runtime.state === "failed") toast(state.runtime.message);
+        else toast(`Applied to ${game.name}`);
       } catch (e) {
         toast(`Attach failed: ${e}`);
       }
@@ -765,6 +813,7 @@ async function handleAction(el: HTMLElement): Promise<void> {
       const data = await api.setActiveProfile(el.dataset.id!);
       state.profiles = data.profiles;
       state.activeProfileId = data.activeProfileId;
+      scheduleRuntimeSync();
       toast("Profile activated");
       break;
     }
