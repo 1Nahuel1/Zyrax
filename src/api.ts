@@ -48,6 +48,10 @@ export interface LayerStats {
   sharpness: number;
   width: number;
   height: number;
+  renderWidth: number;
+  renderHeight: number;
+  upscale: boolean;
+  scale: number;
   format: number;
   pid: number;
   timestamp: number;

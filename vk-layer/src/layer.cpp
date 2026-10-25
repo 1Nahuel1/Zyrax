@@ -1,10 +1,17 @@
 // Zyrax Vulkan implicit layer (Linux)
 // ------------------------------------
-// Intercepts swapchain presentation and applies an FSR-style RCAS (Robust
-// Contrast-Adaptive Sharpening) fragment pass to every presented frame.
+// Intercepts the swapchain and applies FSR 1.0 (EASU upscaling + RCAS
+// sharpening) to every presented frame.
+//
+// When upscaling is on, the surface capabilities are reported at a reduced
+// resolution so the application renders a smaller frame. vkCreateSwapchainKHR
+// then creates the real (full-size) swapchain, and every present is copied into
+// a scratch image and reconstructed to full resolution with EASU + RCAS before
+// the normal present call. No second swapchain or extra acquire is required.
 //
 // Enabled only when ZYRAX_FSR_ENABLE=1 is set (see VkLayer_zyrax_fsr.json).
 // Environment variables:
+//   ZYRAX_FSR_SCALE       render scale (default 1.5, 1.0 disables upscaling)
 //   ZYRAX_FSR_SHARPNESS   0.0 .. 1.0   (default 0.5)
 //   ZYRAX_FSR_DISABLE     set to 1 to hard-disable
 //   ZYRAX_FSR_DEBUG       set to 1 for stderr logging
@@ -17,6 +24,8 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +36,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "rcas_frag.h"
+#define A_CPU 1
+#include "ffx_a.h"
+#include "ffx_fsr1.h"
+
+#include "fsr_easu_frag.h"
+#include "fsr_rcas_frag.h"
 #include "rcas_vert.h"
 
 // ---------------------------------------------------------------------------
@@ -85,9 +99,21 @@ static bool debugEnabled() {
         }                                    \
     } while (0)
 
+static float readScale() {
+    const char* s = getenv("ZYRAX_FSR_SCALE");
+    float v = s ? (float)atof(s) : 1.5f;
+    if (!std::isfinite(v)) v = 1.5f;
+    if (v < 1.0f) v = 1.0f;
+    if (v > 4.0f) v = 4.0f;
+    return v;
+}
+
+static bool upscaleEnabled() { return layerEnabled() && readScale() > 1.001f; }
+
 static float readSharpness() {
     const char* s = getenv("ZYRAX_FSR_SHARPNESS");
     float v = s ? (float)atof(s) : 0.5f;
+    if (!std::isfinite(v)) v = 0.5f;
     if (v < 0.0f) v = 0.0f;
     if (v > 1.0f) v = 1.0f;
     return v;
@@ -103,9 +129,11 @@ static const char* statsPath() {
 // ---------------------------------------------------------------------------
 
 struct PushConstants {
-    float resolution[2];
-    float sharpness;
-    float pad;
+    uint32_t con0[4];
+    uint32_t con1[4];
+    uint32_t con2[4];
+    uint32_t con3[4];
+    uint32_t rcas[4];
 };
 
 struct QueueState {
@@ -115,15 +143,33 @@ struct QueueState {
     VkFence fence = VK_NULL_HANDLE;
 };
 
+// Wayland reports currentExtent == UINT32_MAX, so the layer cannot know the
+// window size until the application creates its first swapchain. We remember
+// that size, report a reduced extent afterwards and ask the app to recreate
+// once (VK_ERROR_OUT_OF_DATE_KHR) so it starts rendering at the lower size.
+struct SurfaceState {
+    bool learned = false;
+    bool disabled = false;
+    VkExtent2D outputExtent{0, 0};
+    uint32_t recreateAttempts = 0;
+    uint32_t recreateBurst = 0;
+    double lastRecreate = 0.0;
+};
+static std::unordered_map<VkSurfaceKHR, SurfaceState> g_surfaces;
+
 struct SwapchainState {
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkExtent2D extent{0, 0};
+    VkExtent2D renderExtent{0, 0};
     VkFormat format = VK_FORMAT_UNDEFINED;
+    bool upscale = false;
     std::vector<VkImage> images;
     std::vector<VkImageView> imageViews;
     std::vector<VkFramebuffer> framebuffers;
     bool enabled = false;
     bool failed = false;
     bool resourcesReady = false;
+    bool forceRecreate = false;
 
     VkImage scratch = VK_NULL_HANDLE;
     VkDeviceMemory scratchMem = VK_NULL_HANDLE;
@@ -131,6 +177,14 @@ struct SwapchainState {
     VkDescriptorSet desc = VK_NULL_HANDLE;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+
+    VkImage intermediate = VK_NULL_HANDLE;
+    VkDeviceMemory intermediateMem = VK_NULL_HANDLE;
+    VkImageView intermediateView = VK_NULL_HANDLE;
+    VkFramebuffer easuFramebuffer = VK_NULL_HANDLE;
+    VkDescriptorSet easuDesc = VK_NULL_HANDLE;
+    VkPipeline easuPipeline = VK_NULL_HANDLE;
+    PushConstants pc{};
 };
 
 struct DeviceState {
@@ -178,6 +232,7 @@ struct DeviceState {
     PFN_vkCreateDescriptorPool CreateDescriptorPool = nullptr;
     PFN_vkDestroyDescriptorPool DestroyDescriptorPool = nullptr;
     PFN_vkAllocateDescriptorSets AllocateDescriptorSets = nullptr;
+    PFN_vkFreeDescriptorSets FreeDescriptorSets = nullptr;
     PFN_vkUpdateDescriptorSets UpdateDescriptorSets = nullptr;
     PFN_vkCreateShaderModule CreateShaderModule = nullptr;
     PFN_vkDestroyShaderModule DestroyShaderModule = nullptr;
@@ -201,6 +256,7 @@ struct DeviceState {
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkShaderModule vertModule = VK_NULL_HANDLE;
     VkShaderModule fragModule = VK_NULL_HANDLE;
+    VkShaderModule easuModule = VK_NULL_HANDLE;
 
     float sharpness = 0.5f;
     uint64_t presents = 0;
@@ -209,6 +265,11 @@ struct DeviceState {
     std::unordered_map<VkQueue, QueueState> queues;
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
 };
+
+static PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR g_nextSurfaceCaps = nullptr;
+static PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR g_nextSurfaceCaps2 = nullptr;
+static PFN_vkGetPhysicalDeviceFormatProperties g_formatProps = nullptr;
+static PFN_vkDestroySurfaceKHR g_nextDestroySurface = nullptr;
 
 static std::unordered_map<VkDevice, DeviceState*> g_devices;
 static std::unordered_map<VkQueue, DeviceState*> g_queueDevice;
@@ -358,9 +419,10 @@ static bool ensureCommon(DeviceState* ds) {
         return false;
     }
 
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32};
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64};
     VkDescriptorPoolCreateInfo poolCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolCi.maxSets = 32;
+    poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    poolCi.maxSets = 64;
     poolCi.poolSizeCount = 1;
     poolCi.pPoolSizes = &size;
     if (ds->CreateDescriptorPool(ds->device, &poolCi, nullptr, &ds->descPool) != VK_SUCCESS) {
@@ -369,8 +431,8 @@ static bool ensureCommon(DeviceState* ds) {
     }
 
     VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sCi.magFilter = VK_FILTER_NEAREST;
-    sCi.minFilter = VK_FILTER_NEAREST;
+    sCi.magFilter = VK_FILTER_LINEAR;
+    sCi.minFilter = VK_FILTER_LINEAR;
     sCi.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -396,8 +458,9 @@ static bool ensureCommon(DeviceState* ds) {
     }
 
     ds->vertModule = makeModule(ds, rcas_vert_spv, rcas_vert_spv_len);
-    ds->fragModule = makeModule(ds, rcas_frag_spv, rcas_frag_spv_len);
-    if (!ds->vertModule || !ds->fragModule) {
+    ds->fragModule = makeModule(ds, fsr_rcas_frag_spv, fsr_rcas_frag_spv_len);
+    ds->easuModule = makeModule(ds, fsr_easu_frag_spv, fsr_easu_frag_spv_len);
+    if (!ds->vertModule || !ds->fragModule || !ds->easuModule) {
         ds->commonFailed = true;
         return false;
     }
@@ -408,40 +471,8 @@ static bool ensureCommon(DeviceState* ds) {
     return true;
 }
 
-static bool buildSwapchainPipeline(DeviceState* ds, SwapchainState* sc) {
-    VkAttachmentDescription color{};
-    color.format = sc->format;
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &colorRef;
-
-    VkSubpassDependency dep{};
-    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-    VkRenderPassCreateInfo rpCi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpCi.attachmentCount = 1;
-    rpCi.pAttachments = &color;
-    rpCi.subpassCount = 1;
-    rpCi.pSubpasses = &subpass;
-    rpCi.dependencyCount = 1;
-    rpCi.pDependencies = &dep;
-    if (ds->CreateRenderPass(ds->device, &rpCi, nullptr, &sc->renderPass) != VK_SUCCESS) return false;
-
+static bool createGraphicsPipeline(DeviceState* ds, SwapchainState* sc, VkShaderModule fragModule,
+                                   VkPipeline* outPipeline) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -449,7 +480,7 @@ static bool buildSwapchainPipeline(DeviceState* ds, SwapchainState* sc) {
     stages[0].pName = "main";
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ds->fragModule;
+    stages[1].module = fragModule;
     stages[1].pName = "main";
 
     VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -496,9 +527,69 @@ static bool buildSwapchainPipeline(DeviceState* ds, SwapchainState* sc) {
     gp.renderPass = sc->renderPass;
     gp.subpass = 0;
 
-    if (ds->CreateGraphicsPipelines(ds->device, VK_NULL_HANDLE, 1, &gp, nullptr, &sc->pipeline) != VK_SUCCESS)
-        return false;
+    return ds->CreateGraphicsPipelines(ds->device, VK_NULL_HANDLE, 1, &gp, nullptr, outPipeline) == VK_SUCCESS;
+}
+
+static bool buildSwapchainPipeline(DeviceState* ds, SwapchainState* sc) {
+    VkAttachmentDescription color{};
+    color.format = sc->format;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo rpCi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpCi.attachmentCount = 1;
+    rpCi.pAttachments = &color;
+    rpCi.subpassCount = 1;
+    rpCi.pSubpasses = &subpass;
+    rpCi.dependencyCount = 1;
+    rpCi.pDependencies = &dep;
+    if (ds->CreateRenderPass(ds->device, &rpCi, nullptr, &sc->renderPass) != VK_SUCCESS) return false;
+
+    if (!createGraphicsPipeline(ds, sc, ds->fragModule, &sc->pipeline)) return false;
+    if (sc->upscale && !createGraphicsPipeline(ds, sc, ds->easuModule, &sc->easuPipeline)) return false;
     return true;
+}
+
+static bool allocateDescriptor(DeviceState* ds, VkDescriptorSet* set) {
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = ds->descPool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &ds->dsl;
+    return ds->AllocateDescriptorSets(ds->device, &ai, set) == VK_SUCCESS;
+}
+
+static void writeDescriptorImage(DeviceState* ds, VkDescriptorSet set, VkImageView view) {
+    VkDescriptorImageInfo srcInfo{};
+    srcInfo.sampler = ds->sampler;
+    srcInfo.imageView = view;
+    srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &srcInfo;
+    ds->UpdateDescriptorSets(ds->device, 1, &write, 0, nullptr);
 }
 
 static bool ensureSwapchainResources(DeviceState* ds, SwapchainState* sc) {
@@ -506,7 +597,9 @@ static bool ensureSwapchainResources(DeviceState* ds, SwapchainState* sc) {
     if (sc->failed || !sc->enabled) return false;
     if (!ensureCommon(ds)) return false;
 
-    sc->scratch = createImage(ds, sc->format, sc->extent,
+    if (sc->renderExtent.width == 0 || sc->renderExtent.height == 0) sc->renderExtent = sc->extent;
+
+    sc->scratch = createImage(ds, sc->format, sc->renderExtent,
                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &sc->scratchMem);
     if (!sc->scratch) {
         sc->failed = true;
@@ -516,6 +609,21 @@ static bool ensureSwapchainResources(DeviceState* ds, SwapchainState* sc) {
     if (!sc->scratchView) {
         sc->failed = true;
         return false;
+    }
+
+    if (sc->upscale) {
+        sc->intermediate =
+            createImage(ds, sc->format, sc->extent,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &sc->intermediateMem);
+        if (!sc->intermediate) {
+            sc->failed = true;
+            return false;
+        }
+        sc->intermediateView = createView(ds, sc->intermediate, sc->format);
+        if (!sc->intermediateView) {
+            sc->failed = true;
+            return false;
+        }
     }
 
     if (!buildSwapchainPipeline(ds, sc)) {
@@ -544,30 +652,44 @@ static bool ensureSwapchainResources(DeviceState* ds, SwapchainState* sc) {
         }
     }
 
-    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = ds->descPool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &ds->dsl;
-    if (ds->AllocateDescriptorSets(ds->device, &ai, &sc->desc) != VK_SUCCESS) {
+    if (sc->upscale) {
+        VkFramebufferCreateInfo fbCi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fbCi.renderPass = sc->renderPass;
+        fbCi.attachmentCount = 1;
+        fbCi.pAttachments = &sc->intermediateView;
+        fbCi.width = sc->extent.width;
+        fbCi.height = sc->extent.height;
+        fbCi.layers = 1;
+        if (ds->CreateFramebuffer(ds->device, &fbCi, nullptr, &sc->easuFramebuffer) != VK_SUCCESS) {
+            sc->failed = true;
+            return false;
+        }
+    }
+
+    if (!allocateDescriptor(ds, &sc->desc)) {
         sc->failed = true;
         return false;
     }
+    writeDescriptorImage(ds, sc->desc, sc->upscale ? sc->intermediateView : sc->scratchView);
+    if (sc->upscale) {
+        if (!allocateDescriptor(ds, &sc->easuDesc)) {
+            sc->failed = true;
+            return false;
+        }
+        writeDescriptorImage(ds, sc->easuDesc, sc->scratchView);
+    }
 
-    VkDescriptorImageInfo srcInfo{};
-    srcInfo.sampler = ds->sampler;
-    srcInfo.imageView = sc->scratchView;
-    srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = sc->desc;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &srcInfo;
-    ds->UpdateDescriptorSets(ds->device, 1, &write, 0, nullptr);
+    AF1 inW = (AF1)sc->renderExtent.width;
+    AF1 inH = (AF1)sc->renderExtent.height;
+    FsrEasuCon(sc->pc.con0, sc->pc.con1, sc->pc.con2, sc->pc.con3, inW, inH, inW, inH,
+               (AF1)sc->extent.width, (AF1)sc->extent.height);
+    AF1 stops = (AF1)((1.0f - ds->sharpness) * 2.0f);
+    FsrRcasCon(sc->pc.rcas, stops);
 
     sc->resourcesReady = true;
-    ZLOG("swapchain resources ready %ux%u format=%d", sc->extent.width, sc->extent.height, (int)sc->format);
+    ZLOG("swapchain resources ready %ux%u <- %ux%u upscale=%d format=%d", sc->extent.width,
+         sc->extent.height, sc->renderExtent.width, sc->renderExtent.height, (int)sc->upscale,
+         (int)sc->format);
     return true;
 }
 
@@ -589,18 +711,54 @@ static QueueState* ensureQueue(DeviceState* ds, VkQueue queue) {
     ai.commandPool = qs.pool;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
-    if (ds->AllocateCommandBuffers(ds->device, &ai, &qs.cmd) != VK_SUCCESS) return nullptr;
+    if (ds->AllocateCommandBuffers(ds->device, &ai, &qs.cmd) != VK_SUCCESS) {
+        ds->DestroyCommandPool(ds->device, qs.pool, nullptr);
+        return nullptr;
+    }
 
     VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (ds->CreateFence(ds->device, &fc, nullptr, &qs.fence) != VK_SUCCESS) return nullptr;
+    if (ds->CreateFence(ds->device, &fc, nullptr, &qs.fence) != VK_SUCCESS) {
+        ds->DestroyCommandPool(ds->device, qs.pool, nullptr);
+        return nullptr;
+    }
 
     auto [pos, _] = ds->queues.emplace(queue, qs);
     return &pos->second;
 }
 
+static void drawFullscreenPass(DeviceState* ds, VkCommandBuffer cb, SwapchainState* sc, VkFramebuffer fb,
+                               VkPipeline pipeline, VkDescriptorSet set) {
+    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp.renderPass = sc->renderPass;
+    rp.framebuffer = fb;
+    rp.renderArea = {{0, 0}, sc->extent};
+    ds->CmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    ds->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    ds->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ds->pipeLayout, 0, 1, &set, 0, nullptr);
+    ds->CmdPushConstants(cb, ds->pipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(sc->pc), &sc->pc);
+
+    VkViewport vp{0, 0, (float)sc->extent.width, (float)sc->extent.height, 0.0f, 1.0f};
+    VkRect2D scc{{0, 0}, sc->extent};
+    ds->CmdSetViewport(cb, 0, 1, &vp);
+    ds->CmdSetScissor(cb, 0, 1, &scc);
+    ds->CmdDraw(cb, 3, 1, 0, 0);
+    ds->CmdEndRenderPass(cb);
+}
+
 static void processFrame(DeviceState* ds, SwapchainState* sc, VkQueue queue, uint32_t index) {
     if (index >= sc->images.size()) return;
-    if (!ensureSwapchainResources(ds, sc)) return;
+    if (!ensureSwapchainResources(ds, sc)) {
+        if (sc->enabled) {
+            // Never leave the application rendering a reduced region into a
+            // full-size swapchain. Disable FSR for this surface and ask for a
+            // single recreate at the native size after the present.
+            if (sc->surface) g_surfaces[sc->surface].disabled = true;
+            sc->enabled = false;
+            sc->forceRecreate = true;
+            ZLOG("disabling FSR after resource failure");
+        }
+        return;
+    }
     QueueState* qs = ensureQueue(ds, queue);
     if (!qs) return;
 
@@ -613,40 +771,29 @@ static void processFrame(DeviceState* ds, SwapchainState* sc, VkQueue queue, uin
     if (ds->BeginCommandBuffer(qs->cmd, &bi) != VK_SUCCESS) return;
     VkCommandBuffer cb = qs->cmd;
 
-    // Copy the presented frame into our scratch image.
+    // Copy the presented frame (game resolution) into our scratch image.
     imageBarrier(ds, cb, swImg, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     imageBarrier(ds, cb, sc->scratch, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     copyImage(ds, cb, swImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->scratch,
-              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sc->extent);
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sc->renderExtent);
     imageBarrier(ds, cb, sc->scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    if (sc->upscale) {
+        // EASU: low-res scratch -> full-res intermediate.
+        imageBarrier(ds, cb, sc->intermediate, VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        drawFullscreenPass(ds, cb, sc, sc->easuFramebuffer, sc->easuPipeline, sc->easuDesc);
+        imageBarrier(ds, cb, sc->intermediate, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    // RCAS: sharpen (and for the non-upscale path, read the scratch directly).
     imageBarrier(ds, cb, swImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-    // Sharpen into the swapchain image.
-    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rp.renderPass = sc->renderPass;
-    rp.framebuffer = fb;
-    rp.renderArea = {{0, 0}, sc->extent};
-    ds->CmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    ds->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sc->pipeline);
-    ds->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ds->pipeLayout, 0, 1, &sc->desc, 0, nullptr);
-
-    PushConstants pc{};
-    pc.resolution[0] = (float)sc->extent.width;
-    pc.resolution[1] = (float)sc->extent.height;
-    pc.sharpness = ds->sharpness;
-    pc.pad = 0.0f;
-    ds->CmdPushConstants(cb, ds->pipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-    VkViewport vp{0, 0, (float)sc->extent.width, (float)sc->extent.height, 0.0f, 1.0f};
-    VkRect2D scc{{0, 0}, sc->extent};
-    ds->CmdSetViewport(cb, 0, 1, &vp);
-    ds->CmdSetScissor(cb, 0, 1, &scc);
-    ds->CmdDraw(cb, 3, 1, 0, 0);
-    ds->CmdEndRenderPass(cb);
-
-    imageBarrier(ds, cb, swImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    drawFullscreenPass(ds, cb, sc, fb, sc->pipeline, sc->desc);
+    imageBarrier(ds, cb, swImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
     if (ds->EndCommandBuffer(cb) != VK_SUCCESS) return;
 
@@ -670,18 +817,27 @@ static void writeStats(DeviceState* ds) {
     if (!f) return;
 
     VkExtent2D ext{0, 0};
+    VkExtent2D renderExt{0, 0};
     VkFormat fmt = VK_FORMAT_UNDEFINED;
+    bool upscale = false;
+    bool found = false;
     for (auto& kv : ds->swapchains) {
-        if (kv.second.enabled) {
+        if (kv.second.enabled && !kv.second.failed) {
             ext = kv.second.extent;
+            renderExt = kv.second.renderExtent;
             fmt = kv.second.format;
+            upscale = kv.second.upscale;
+            found = true;
             break;
         }
     }
     fprintf(f,
-            "{\"enabled\":true,\"presents\":%llu,\"sharpness\":%.3f,"
-            "\"width\":%u,\"height\":%u,\"format\":%d,\"pid\":%d,\"timestamp\":%lld}\n",
-            (unsigned long long)ds->presents, ds->sharpness, ext.width, ext.height, (int)fmt,
+            "{\"enabled\":%s,\"presents\":%llu,\"sharpness\":%.3f,"
+            "\"width\":%u,\"height\":%u,\"renderWidth\":%u,\"renderHeight\":%u,"
+            "\"upscale\":%s,\"scale\":%.3f,\"format\":%d,\"pid\":%d,\"timestamp\":%lld}\n",
+            found ? "true" : "false", (unsigned long long)ds->presents, ds->sharpness, ext.width,
+            ext.height, renderExt.width, renderExt.height, upscale ? "true" : "false",
+            renderExt.width ? (float)ext.width / (float)renderExt.width : 1.0f, (int)fmt,
             (int)getpid(), (long long)time(nullptr));
     fclose(f);
 }
@@ -694,18 +850,109 @@ static void destroySwapchainResources(DeviceState* ds, SwapchainState* sc) {
     sc->framebuffers.clear();
     sc->imageViews.clear();
 
+    if (sc->desc && ds->FreeDescriptorSets)
+        ds->FreeDescriptorSets(ds->device, ds->descPool, 1, &sc->desc);
+    if (sc->easuDesc && ds->FreeDescriptorSets)
+        ds->FreeDescriptorSets(ds->device, ds->descPool, 1, &sc->easuDesc);
+    sc->desc = VK_NULL_HANDLE;
+    sc->easuDesc = VK_NULL_HANDLE;
+    if (sc->easuFramebuffer) ds->DestroyFramebuffer(ds->device, sc->easuFramebuffer, nullptr);
+    if (sc->easuPipeline) ds->DestroyPipeline(ds->device, sc->easuPipeline, nullptr);
     if (sc->pipeline) ds->DestroyPipeline(ds->device, sc->pipeline, nullptr);
     if (sc->renderPass) ds->DestroyRenderPass(ds->device, sc->renderPass, nullptr);
+    if (sc->intermediateView) ds->DestroyImageView(ds->device, sc->intermediateView, nullptr);
+    if (sc->intermediate) ds->DestroyImage(ds->device, sc->intermediate, nullptr);
+    if (sc->intermediateMem) ds->FreeMemory(ds->device, sc->intermediateMem, nullptr);
     if (sc->scratchView) ds->DestroyImageView(ds->device, sc->scratchView, nullptr);
     if (sc->scratch) ds->DestroyImage(ds->device, sc->scratch, nullptr);
     if (sc->scratchMem) ds->FreeMemory(ds->device, sc->scratchMem, nullptr);
 
+    sc->easuFramebuffer = VK_NULL_HANDLE;
+    sc->easuPipeline = VK_NULL_HANDLE;
     sc->pipeline = VK_NULL_HANDLE;
     sc->renderPass = VK_NULL_HANDLE;
+    sc->intermediateView = VK_NULL_HANDLE;
+    sc->intermediate = VK_NULL_HANDLE;
+    sc->intermediateMem = VK_NULL_HANDLE;
     sc->scratchView = VK_NULL_HANDLE;
     sc->scratch = VK_NULL_HANDLE;
     sc->scratchMem = VK_NULL_HANDLE;
     sc->resourcesReady = false;
+}
+
+// ---------------------------------------------------------------------------
+// Surface capabilities: report a reduced size so the game renders lower-res
+// ---------------------------------------------------------------------------
+
+static VkExtent2D reducedExtent(VkExtent2D output, float scale) {
+    VkExtent2D r{1, 1};
+    r.width = (uint32_t)((float)output.width / scale + 0.5f);
+    r.height = (uint32_t)((float)output.height / scale + 0.5f);
+    if (r.width < 1) r.width = 1;
+    if (r.height < 1) r.height = 1;
+    return r;
+}
+
+static bool extentNear(VkExtent2D a, VkExtent2D b) {
+    int dw = (int)a.width - (int)b.width;
+    int dh = (int)a.height - (int)b.height;
+    if (dw < 0) dw = -dw;
+    if (dh < 0) dh = -dh;
+    return dw <= 2 && dh <= 2;
+}
+
+static void applyUpscaleExtent(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* caps) {
+    ZLOG("caps hook: current=%ux%u min=%ux%u max=%ux%u scale=%.2f up=%d", caps->currentExtent.width,
+         caps->currentExtent.height, caps->minImageExtent.width, caps->minImageExtent.height,
+         caps->maxImageExtent.width, caps->maxImageExtent.height, (double)readScale(),
+         (int)upscaleEnabled());
+    if (!layerEnabled()) return;
+    if (!(caps->supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        ZLOG("caps hook: surface cannot be a transfer source, not reducing");
+        return;
+    }
+    if (!upscaleEnabled()) return;
+
+    VkExtent2D output = caps->currentExtent;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_surfaces.find(surface);
+        if (it != g_surfaces.end() && it->second.disabled) return;
+        if (output.width == UINT32_MAX || output.height == UINT32_MAX) {
+            if (it == g_surfaces.end() || !it->second.learned) return;
+            output = it->second.outputExtent;
+        }
+    }
+
+    VkExtent2D lower = reducedExtent(output, readScale());
+    if (lower.width >= output.width || lower.height >= output.height) return;
+
+    // Report a smaller surface so the application renders fewer pixels. The
+    // real swapchain is still created at the true size in vkCreateSwapchainKHR.
+    caps->minImageExtent = {1, 1};
+    if (caps->maxImageExtent.width < lower.width) caps->maxImageExtent.width = lower.width;
+    if (caps->maxImageExtent.height < lower.height) caps->maxImageExtent.height = lower.height;
+    caps->currentExtent = lower;
+    ZLOG("caps hook: output %ux%u reported %ux%u", output.width, output.height, lower.width,
+         lower.height);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+LayerGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice gpu, VkSurfaceKHR surface,
+                                             VkSurfaceCapabilitiesKHR* caps) {
+    if (!g_nextSurfaceCaps) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = g_nextSurfaceCaps(gpu, surface, caps);
+    if (r == VK_SUCCESS && caps) applyUpscaleExtent(surface, caps);
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+LayerGetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice gpu, const VkPhysicalDeviceSurfaceInfo2KHR* info,
+                                              VkSurfaceCapabilities2KHR* caps) {
+    if (!g_nextSurfaceCaps2) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = g_nextSurfaceCaps2(gpu, info, caps);
+    if (r == VK_SUCCESS && caps) applyUpscaleExtent(info->surface, &caps->surfaceCapabilities);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -747,9 +994,28 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVersionStruct
 
 extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetPhysicalDeviceProcAddr(VkInstance instance,
                                                                                const char* pName) {
+    if (pName) {
+        if (!strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"))
+            return (PFN_vkVoidFunction)LayerGetPhysicalDeviceSurfaceCapabilitiesKHR;
+        if (!strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilities2KHR"))
+            return (PFN_vkVoidFunction)LayerGetPhysicalDeviceSurfaceCapabilities2KHR;
+    }
     if (g_nextPDPA) return (PFN_vkVoidFunction)g_nextPDPA(instance, pName);
     auto gipa = chainGIPA();
     return gipa ? (PFN_vkVoidFunction)gipa(instance, pName) : nullptr;
+}
+
+static VKAPI_ATTR void VKAPI_CALL LayerDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+                                                          const VkAllocationCallbacks* pAllocator) {
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        g_surfaces.erase(surface);
+    }
+    if (!g_nextDestroySurface) {
+        auto gipa = chainGIPA();
+        if (gipa) g_nextDestroySurface = (PFN_vkDestroySurfaceKHR)gipa(instance, "vkDestroySurfaceKHR");
+    }
+    if (g_nextDestroySurface) g_nextDestroySurface(instance, surface, pAllocator);
 }
 
 extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName) {
@@ -759,6 +1025,11 @@ extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInst
     if (!strcmp(pName, "vkGetPhysicalDeviceProcAddr")) return (PFN_vkVoidFunction)vkGetPhysicalDeviceProcAddr;
     if (!strcmp(pName, "vkCreateInstance")) return (PFN_vkVoidFunction)LayerCreateInstance;
     if (!strcmp(pName, "vkCreateDevice")) return (PFN_vkVoidFunction)LayerCreateDevice;
+    if (!strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"))
+        return (PFN_vkVoidFunction)LayerGetPhysicalDeviceSurfaceCapabilitiesKHR;
+    if (!strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilities2KHR"))
+        return (PFN_vkVoidFunction)LayerGetPhysicalDeviceSurfaceCapabilities2KHR;
+    if (!strcmp(pName, "vkDestroySurfaceKHR")) return (PFN_vkVoidFunction)LayerDestroySurfaceKHR;
 
     auto gipa = chainGIPA();
     return gipa ? (PFN_vkVoidFunction)gipa(instance, pName) : nullptr;
@@ -792,6 +1063,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateInstance(const VkInstanceCreate
     if (res == VK_SUCCESS) {
         g_nextGIPA = fpGIPA;
         g_instance = *pInstance;
+        g_nextSurfaceCaps = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)fpGIPA(
+            *pInstance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+        g_nextSurfaceCaps2 = (PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR)fpGIPA(
+            *pInstance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
+        g_formatProps = (PFN_vkGetPhysicalDeviceFormatProperties)fpGIPA(
+            *pInstance, "vkGetPhysicalDeviceFormatProperties");
+        g_nextDestroySurface =
+            (PFN_vkDestroySurfaceKHR)fpGIPA(*pInstance, "vkDestroySurfaceKHR");
         ZLOG("instance created");
     }
     return res;
@@ -866,6 +1145,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice gpu, co
     LOAD(CreateDescriptorPool);
     LOAD(DestroyDescriptorPool);
     LOAD(AllocateDescriptorSets);
+    LOAD(FreeDescriptorSets);
     LOAD(UpdateDescriptorSets);
     LOAD(CreateShaderModule);
     LOAD(DestroyShaderModule);
@@ -921,21 +1201,153 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
         return fp(device, pCreateInfo, pAllocator, pSwapchain);
     }
 
-    VkSwapchainCreateInfoKHR ci = *pCreateInfo;
-    ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkExtent2D renderExtent = pCreateInfo->imageExtent;
+    VkExtent2D outputExtent = renderExtent;
+    bool upscale = false;
+    bool forceRecreate = false;
 
+    VkSurfaceCapabilitiesKHR real{};
+    bool haveReal =
+        g_nextSurfaceCaps && g_nextSurfaceCaps(ds->gpu, pCreateInfo->surface, &real) == VK_SUCCESS;
+    bool concrete = haveReal && real.currentExtent.width != UINT32_MAX && real.currentExtent.height != UINT32_MAX;
+    if (concrete) outputExtent = real.currentExtent;
+
+    bool capsTransfer = haveReal && (real.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    bool usageColor = (pCreateInfo->imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+    bool formatOk = true;
+    if (g_formatProps) {
+        VkFormatProperties fp{};
+        g_formatProps(ds->gpu, pCreateInfo->imageFormat, &fp);
+        VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        formatOk = (fp.optimalTilingFeatures & need) == need;
+    }
+    bool canProcess = layerEnabled() && capsTransfer && usageColor && formatOk;
+    if (!canProcess) {
+        ZLOG("swapchain cannot use FSR (transfer=%d color=%d format=%d)", (int)capsTransfer,
+             (int)usageColor, (int)formatOk);
+        bool wasReduced = false;
+        if (concrete) {
+            wasReduced = renderExtent.width < real.currentExtent.width ||
+                         renderExtent.height < real.currentExtent.height;
+        }
+        bool newlyDisabled = false;
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            SurfaceState& st = g_surfaces[pCreateInfo->surface];
+            newlyDisabled = !st.disabled;
+            st.disabled = true;
+            if (!concrete && st.learned) {
+                outputExtent = st.outputExtent;
+                wasReduced = extentNear(renderExtent, reducedExtent(st.outputExtent, readScale()));
+            }
+        }
+        if (newlyDisabled && wasReduced) forceRecreate = true;
+    } else if (upscaleEnabled()) {
+        if (concrete) {
+            if (real.currentExtent.width >= renderExtent.width &&
+                real.currentExtent.height >= renderExtent.height &&
+                (real.currentExtent.width > renderExtent.width ||
+                 real.currentExtent.height > renderExtent.height)) {
+                outputExtent = real.currentExtent;
+                upscale = true;
+            }
+        } else {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            SurfaceState& st = g_surfaces[pCreateInfo->surface];
+            if (!st.disabled) {
+                auto requestRecreate = [&]() {
+                    double now = nowSeconds();
+                    if (now - st.lastRecreate > 2.0) st.recreateBurst = 0;
+                    st.lastRecreate = now;
+                    st.recreateBurst++;
+                    if (st.recreateBurst <= 6) {
+                        forceRecreate = true;
+                    } else {
+                        st.disabled = true;
+                        ZLOG("wayland: too many recreate requests, disabling upscale");
+                    }
+                };
+                VkExtent2D expectedRender = reducedExtent(st.outputExtent, readScale());
+                if (!st.learned) {
+                    st.outputExtent = pCreateInfo->imageExtent;
+                    st.learned = true;
+                    st.recreateAttempts = 0;
+                    requestRecreate();
+                    ZLOG("wayland: learned output %ux%u, asking for one recreate",
+                         st.outputExtent.width, st.outputExtent.height);
+                } else if (extentNear(renderExtent, expectedRender)) {
+                    outputExtent = st.outputExtent;
+                    upscale = true;
+                    st.recreateAttempts = 0;
+                } else if (extentNear(renderExtent, st.outputExtent)) {
+                    st.recreateAttempts++;
+                    if (st.recreateAttempts >= 2) st.disabled = true;
+                    ZLOG("wayland: app ignored reduced extent, rendering full size (attempt %u)",
+                         st.recreateAttempts);
+                } else if (st.recreateAttempts < 2) {
+                    st.outputExtent = pCreateInfo->imageExtent;
+                    st.recreateAttempts++;
+                    requestRecreate();
+                    ZLOG("wayland: app requested a new extent %ux%u, expected %ux%u, re-learning",
+                         renderExtent.width, renderExtent.height, expectedRender.width,
+                         expectedRender.height);
+                } else {
+                    st.disabled = true;
+                    ZLOG("wayland: disabling upscale, app keeps its own extent");
+                }
+            }
+        }
+    }
+
+    if (upscale) {
+        renderExtent.width = std::min(renderExtent.width, outputExtent.width);
+        renderExtent.height = std::min(renderExtent.height, outputExtent.height);
+        if (renderExtent.width >= outputExtent.width || renderExtent.height >= outputExtent.height)
+            upscale = false;
+    }
+
+    VkSwapchainCreateInfoKHR ci = *pCreateInfo;
+    if (upscale) ci.imageExtent = outputExtent;
+    if (canProcess) ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    VkExtent2D createdExtent = ci.imageExtent;
     VkResult res = ds->CreateSwapchainKHR(device, &ci, pAllocator, pSwapchain);
-    bool enabled = true;
+    bool enabled = canProcess;
     if (res != VK_SUCCESS) {
-        res = ds->CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+        // The driver rejected the extra usage or the reduced/full extent. Try the
+        // application's original extent without touching imageUsage first.
+        VkSwapchainCreateInfoKHR fb = *pCreateInfo;
+        res = ds->CreateSwapchainKHR(device, &fb, pAllocator, pSwapchain);
+        if (res == VK_SUCCESS) {
+            createdExtent = fb.imageExtent;
+        } else {
+            fb.imageExtent = outputExtent;
+            res = ds->CreateSwapchainKHR(device, &fb, pAllocator, pSwapchain);
+            if (res == VK_SUCCESS) createdExtent = fb.imageExtent;
+        }
         enabled = false;
+        upscale = false;
         if (res != VK_SUCCESS) return res;
+        forceRecreate = true;
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            g_surfaces[pCreateInfo->surface].disabled = true;
+        }
+        ZLOG("swapchain rejected FSR usage; passthrough and one recreate");
     }
 
     SwapchainState sc;
-    sc.extent = pCreateInfo->imageExtent;
+    sc.surface = pCreateInfo->surface;
+    sc.extent = createdExtent;
+    sc.renderExtent = renderExtent;
     sc.format = pCreateInfo->imageFormat;
+    sc.renderExtent.width = std::min(sc.renderExtent.width, sc.extent.width);
+    sc.renderExtent.height = std::min(sc.renderExtent.height, sc.extent.height);
+    sc.upscale = upscale && enabled;
     sc.enabled = enabled && layerEnabled();
+    sc.forceRecreate = forceRecreate;
 
     uint32_t count = 0;
     ds->GetSwapchainImagesKHR(device, *pSwapchain, &count, nullptr);
@@ -946,8 +1358,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchainKHR(VkDevice device,
         std::lock_guard<std::mutex> lk(g_mutex);
         ds->swapchains[*pSwapchain] = std::move(sc);
     }
-    ZLOG("swapchain created %ux%u format=%d enabled=%d", pCreateInfo->imageExtent.width,
-         pCreateInfo->imageExtent.height, (int)pCreateInfo->imageFormat, (int)enabled);
+    ZLOG("swapchain created %ux%u <- %ux%u upscale=%d format=%d enabled=%d", sc.extent.width,
+         sc.extent.height, sc.renderExtent.width, sc.renderExtent.height, (int)sc.upscale,
+         (int)pCreateInfo->imageFormat, (int)enabled);
     return res;
 }
 
@@ -986,8 +1399,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL LayerQueuePresentKHR(VkQueue queue, const 
         writeStats(ds);
     }
 
-    if (ds && ds->QueuePresentKHR) return ds->QueuePresentKHR(queue, pPresentInfo);
-    return VK_ERROR_INITIALIZATION_FAILED;
+    if (!ds || !ds->QueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult res = ds->QueuePresentKHR(queue, pPresentInfo);
+    if (res != VK_SUCCESS) ZLOG("present result=%d", (int)res);
+
+    bool recreate = false;
+    if (layerEnabled()) {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+            auto it = ds->swapchains.find(pPresentInfo->pSwapchains[i]);
+            if (it != ds->swapchains.end() && it->second.forceRecreate) {
+                it->second.forceRecreate = false;
+                recreate = true;
+            }
+        }
+    }
+    if (recreate && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
+        ZLOG("wayland: returning OUT_OF_DATE so the app recreates at the reduced size");
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    return res;
 }
 
 static VKAPI_ATTR void VKAPI_CALL LayerDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator) {
@@ -1017,6 +1448,7 @@ static VKAPI_ATTR void VKAPI_CALL LayerDestroyDevice(VkDevice device, const VkAl
         for (auto& kv : ds->swapchains) destroySwapchainResources(ds, &kv.second);
         if (ds->vertModule) ds->DestroyShaderModule(device, ds->vertModule, nullptr);
         if (ds->fragModule) ds->DestroyShaderModule(device, ds->fragModule, nullptr);
+        if (ds->easuModule) ds->DestroyShaderModule(device, ds->easuModule, nullptr);
         if (ds->pipeLayout) ds->DestroyPipelineLayout(device, ds->pipeLayout, nullptr);
         if (ds->descPool) ds->DestroyDescriptorPool(device, ds->descPool, nullptr);
         if (ds->dsl) ds->DestroyDescriptorSetLayout(device, ds->dsl, nullptr);

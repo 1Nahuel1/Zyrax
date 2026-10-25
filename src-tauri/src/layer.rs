@@ -20,6 +20,14 @@ pub struct LayerStats {
     #[serde(default)]
     pub height: u32,
     #[serde(default)]
+    pub render_width: u32,
+    #[serde(default)]
+    pub render_height: u32,
+    #[serde(default)]
+    pub upscale: bool,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+    #[serde(default)]
     pub format: i32,
     #[serde(default)]
     pub pid: i32,
@@ -39,6 +47,10 @@ pub struct LayerStatus {
     pub stats: Option<LayerStats>,
     pub active: bool,
     pub message: String,
+}
+
+fn default_scale() -> f32 {
+    1.0
 }
 
 fn stats_path() -> PathBuf {
@@ -204,7 +216,7 @@ mod tests {
         let path = dir.join("stats.json");
         fs::write(
             &path,
-            r#"{"enabled":true,"presents":787,"sharpness":0.800,"width":939,"height":1016,"format":97,"pid":123,"timestamp":1700000000}"#,
+            r#"{"enabled":true,"presents":787,"sharpness":0.800,"width":939,"height":1016,"renderWidth":626,"renderHeight":677,"upscale":true,"scale":1.500,"format":97,"pid":123,"timestamp":1700000000}"#,
         )
         .unwrap();
 
@@ -213,6 +225,9 @@ mod tests {
         assert_eq!(stats.presents, 787);
         assert!((stats.sharpness - 0.8).abs() < 1e-6);
         assert_eq!((stats.width, stats.height), (939, 1016));
+        assert_eq!((stats.render_width, stats.render_height), (626, 677));
+        assert!(stats.upscale);
+        assert!((stats.scale - 1.5).abs() < 1e-6);
         assert_eq!(stats.format, 97);
         assert_eq!(stats.pid, 123);
 

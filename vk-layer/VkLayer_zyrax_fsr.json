@@ -4,9 +4,9 @@
     "name": "VK_LAYER_ZYRAX_fsr",
     "type": "GLOBAL",
     "library_path": "./libzyrax_fsr.so",
-    "api_version": "1.3.0",
+    "api_version": "1.4.0",
     "implementation_version": "1",
-    "description": "Zyrax FSR-style adaptive sharpening layer",
+    "description": "Zyrax FSR 1.0 EASU + RCAS upscaling layer",
     "functions": {
       "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
       "vkGetDeviceProcAddr": "vkGetDeviceProcAddr",

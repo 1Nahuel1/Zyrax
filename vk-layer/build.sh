@@ -10,16 +10,21 @@ GLSLANG=${GLSLANG:-glslangValidator}
 CXX=${CXX:-g++}
 
 echo "[1/4] compiling FSR shaders"
-for stage in vert frag; do
-  "$GLSLANG" -V "shaders/rcas.${stage}" -o "$OUT/rcas_${stage}.spv" >/dev/null
-  spirv-val "$OUT/rcas_${stage}.spv"
-  ( cd "$OUT" && xxd -i "rcas_${stage}.spv" > "rcas_${stage}.h" )
-  echo "      -> rcas_${stage}.spv"
-done
+compile_shader() {
+  local src="$1" name="$2"
+  "$GLSLANG" -V -Ithird_party "shaders/$src" -o "$OUT/$name.spv" >/dev/null
+  spirv-val "$OUT/$name.spv"
+  ( cd "$OUT" && xxd -i "$name.spv" > "$name.h" )
+  echo "      -> $name.spv"
+}
+
+compile_shader fsr_easu.frag fsr_easu_frag
+compile_shader fsr_rcas.frag fsr_rcas_frag
+compile_shader rcas.vert rcas_vert
 
 echo "[2/4] compiling layer"
-"$CXX" -O2 -std=c++17 -fPIC -shared -Wall -Wextra \
-  -I"$OUT" \
+"$CXX" -O2 -std=c++17 -fPIC -shared -Wall -Wextra -Wno-unused-function \
+  -I"$OUT" -Ithird_party \
   -o "$OUT/libzyrax_fsr.so" \
   src/layer.cpp -ldl
 

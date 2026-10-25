@@ -496,7 +496,9 @@ function renderLayerCard(): string {
   const statsHtml = stats
     ? `<div class="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400">
          <div>Frames: <span class="text-cyber-cyan">${stats.presents}</span></div>
-         <div>Resolution: <span class="text-cyber-cyan">${stats.width}x${stats.height}</span></div>
+         <div>Output: <span class="text-cyber-cyan">${stats.width}x${stats.height}</span></div>
+         <div>Render: <span class="text-cyber-cyan">${stats.renderWidth}x${stats.renderHeight}</span></div>
+         <div>Mode: <span class="text-cyber-cyan">${stats.upscale ? `FSR x${stats.scale.toFixed(2)}` : "RCAS only"}</span></div>
          <div>Sharpness: <span class="text-cyber-cyan">${stats.sharpness.toFixed(2)}</span></div>
          <div>Format: <span class="text-cyber-cyan">${formatLabel(stats.format)}</span></div>
          <div>PID: <span class="text-cyber-cyan">${stats.pid}</span></div>

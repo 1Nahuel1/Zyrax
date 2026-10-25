@@ -41,17 +41,17 @@ cyberpunk UI built with Tauri + Rust and a Vite/TypeScript frontend.
 This is an **alpha**. The application shell, game/GPU detection, profile
 management, persistence and the full cyberpunk UI are implemented and working.
 
-The **graphics interception layer** that actually injects FSR/DLSS and
-frame generation into a game's render pipeline is the next milestone. The
-`attach_to_game` command already validates the target process and manages the
-hook lifecycle (`idle → attaching → active`); the rendering hooks plug into
-that lifecycle.
+The **graphics interception layer** that injects FSR and frame generation into
+a game's render pipeline is under active development. The `attach_to_game`
+command already validates the target process and manages the hook lifecycle
+(`idle → attaching → active`); the rendering hooks plug into that lifecycle.
 
-On Linux there is a working **Vulkan implicit layer** (see below) that hooks
-`vkQueuePresentKHR` and applies an RCAS-style adaptive sharpening pass on the
-presented image. It is real, testable code — but it is sharpening, not a full
-resolution-changing FSR upscale yet. The app detects the layer and reads live
-frame stats from it in **Settings**.
+On Linux there is a working **Vulkan implicit layer** (see below) that performs
+a real, resolution-changing **FSR 1.0** upscale: the game is told to render at
+`1 / scale` of the surface, then the layer runs **EASU** (edge-adaptive spatial
+upscaling) followed by **RCAS** (robust contrast adaptive sharpening) up to the
+full output size. The app detects the layer and reads live frame stats from it
+in **Settings**.
 
 ## Vulkan layer (Linux, alpha)
 
@@ -75,18 +75,37 @@ For Steam games, set the launch options to `ZYRAX_FSR_ENABLE=1 %command%`.
 | --- | --- |
 | `ZYRAX_FSR_ENABLE=1` | Enable the layer (implicit layers are opt-in here). |
 | `ZYRAX_FSR_DISABLE=1` | Force-disable it. |
-| `ZYRAX_FSR_SHARPNESS` | Sharpening strength, `0.0`–`1.0` (default `0.5`). |
+| `ZYRAX_FSR_SCALE` | FSR scale factor `1.0`–`4.0` (default `1.5`). `1.0` = sharpening only. |
+| `ZYRAX_FSR_SHARPNESS` | RCAS sharpening strength, `0.0`–`1.0` (default `0.5`). |
 | `ZYRAX_FSR_STATS` | JSON stats path (default `/tmp/zyrax_fsr_stats.json`). |
 | `ZYRAX_FSR_DEBUG=1` | Print layer diagnostics to stderr. |
 
-The layer wraps `vkCreateSwapchainKHR` (adds transfer usage), copies each
-presented image into a scratch image and runs a full-screen RCAS pass back into
-the swapchain image before `vkQueuePresentKHR`. If the swapchain rejects the
-extra usage, the layer transparently falls back to passthrough.
+How it works:
 
-Limitations: no resolution change (no real upscale), no frame generation, and
-it only targets Vulkan swapchains presented on the hooked queue. DXVK/Proton
-games generally work, but this has only been validated with `vkcube` so far.
+1. The layer reports a reduced surface size through
+   `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`, so the application renders at
+   `output / scale`.
+2. `vkCreateSwapchainKHR` is intercepted to add transfer usage and to create
+   the real swapchain at the full output size.
+3. At present time the layer copies the low-res region into a scratch image,
+   runs **EASU** into an intermediate full-size image and **RCAS** into the
+   swapchain image. `sc.upscale` / `sc.renderExtent` keep both sizes separate.
+4. On Wayland, `currentExtent` is `UINT32_MAX`; the layer learns the window size
+   from the first swapchain and requests a single
+   `VK_ERROR_OUT_OF_DATE_KHR` recreate so the app switches to the reduced
+   extent.
+5. If the swapchain cannot be sampled as a transfer source, lacks the required
+   format features, or resource creation fails, the layer disables FSR for that
+   surface, presents in passthrough and requests one recreate at the native
+   size.
+
+Limitations: no frame generation; only Vulkan swapchains presented on the
+hooked queue; swapchain alpha is not preserved (output is opaque); on Wayland,
+resizing the window after startup may keep the original internal output
+resolution until the app recreates with a new size.
+Validated with `vkcube` on RADV under Wayland and X11, with the broken
+`VK_LAYER_LSFGVK_frame_generation` implicit layer and other overlays disabled.
+DXVK games should work but have not been exhaustively tested.
 
 ## Getting started
 
@@ -120,8 +139,8 @@ src-tauri/src/
   runtime.rs             # hook lifecycle & runtime status
   layer.rs               # Vulkan layer discovery, install & live stats
 vk-layer/                # Linux Vulkan implicit layer (C++)
-  src/layer.cpp          # loader interface, swapchain/present hooks, RCAS pass
-  shaders/rcas.*         # full-screen triangle + sharpening shader
+  src/layer.cpp          # loader interface, swapchain/present hooks, FSR EASU + RCAS passes
+  shaders/               # full-screen triangle + FSR EASU/RCAS shaders
   build.sh               # shader compile + shared library build
   install.sh             # per-user install into ~/.local/share/vulkan
 ```
@@ -143,8 +162,7 @@ vk-layer/                # Linux Vulkan implicit layer (C++)
 - [x] GPU & graphics API detection
 - [x] Profile management with persistence
 - [x] Runtime hook lifecycle & status
-- [x] Vulkan implicit layer (Linux) with RCAS sharpening pass
-- [ ] Resolution-changing FSR upscale in the Vulkan layer
+- [x] Vulkan implicit layer (Linux) with EASU + RCAS resolution-changing FSR upscale
 - [ ] DXGI swapchain hook (Windows) with FSR
 - [ ] DLSS integration
 - [ ] Frame generation pipeline
