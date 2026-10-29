@@ -1,4 +1,5 @@
 import "./style.css";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -40,6 +41,9 @@ const state: State = {
     sharpness: 0.5,
     frameGeneration: false,
     overlayEnabled: false,
+    overlayShowFps: true,
+    overlayShowScale: true,
+    overlayPosition: "bottom-left",
     injectedAt: null,
     message: "Ready. Select a game to attach Zyrax.",
   },
@@ -394,6 +398,13 @@ function renderFramegen(): string {
 
 function renderOverlay(): string {
   const p = activeProfile();
+  const positions = [
+    ["bottom-left", "BOTTOM LEFT"],
+    ["bottom-right", "BOTTOM RIGHT"],
+    ["top-left", "TOP LEFT"],
+    ["top-right", "TOP RIGHT"],
+  ] as const;
+
   return `
     <h1 class="text-xl font-bold text-cyber-green cyber-glow mb-1">[ OVERLAY ]</h1>
     <div class="h-px bg-gradient-to-r from-cyber-green via-cyber-cyan to-transparent mb-6"></div>
@@ -405,7 +416,7 @@ function renderOverlay(): string {
         <div class="flex items-center justify-between">
           <div>
             <div class="text-sm text-white">IN-GAME OVERLAY</div>
-            <div class="text-xs text-gray-400 mt-1">Draws an FPS and scale HUD with the FSR shader.</div>
+            <div class="text-xs text-gray-400 mt-1">Draws a live HUD with the FSR shader.</div>
           </div>
           <button data-action="toggle-overlay" class="w-14 h-7 border ${
             p.overlayEnabled
@@ -419,12 +430,48 @@ function renderOverlay(): string {
         </div>
       </div>
 
+      <div class="bg-cyber-panel/60 border border-cyber-cyan/30 p-5 mb-4 ${
+        p.overlayEnabled ? "" : "opacity-50"
+      }">
+        <div class="text-sm text-cyber-cyan mb-3">HUD ELEMENTS</div>
+        <div class="grid grid-cols-2 gap-3">
+          <button data-action="toggle-overlay-fps" class="px-3 py-2 border text-xs transition-all ${
+            p.overlayShowFps
+              ? "border-cyber-green/60 text-cyber-green bg-cyber-green/10"
+              : "border-white/10 text-gray-400"
+          }">FPS COUNTER: ${p.overlayShowFps ? "ON" : "OFF"}</button>
+          <button data-action="toggle-overlay-scale" class="px-3 py-2 border text-xs transition-all ${
+            p.overlayShowScale
+              ? "border-cyber-green/60 text-cyber-green bg-cyber-green/10"
+              : "border-white/10 text-gray-400"
+          }">SCALE: ${p.overlayShowScale ? "ON" : "OFF"}</button>
+        </div>
+      </div>
+
+      <div class="bg-cyber-panel/60 border border-cyber-cyan/30 p-5 mb-4 ${
+        p.overlayEnabled ? "" : "opacity-50"
+      }">
+        <div class="text-sm text-cyber-cyan mb-3">POSITION</div>
+        <div class="grid grid-cols-2 gap-3">
+          ${positions
+            .map(
+              ([value, label]) => `
+            <button data-action="set-overlay-position" data-value="${value}" class="px-3 py-2 border text-xs transition-all ${
+              p.overlayPosition === value
+                ? "border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10"
+                : "border-white/10 text-gray-400 hover:border-cyber-cyan/40"
+            }">${label}</button>`
+            )
+            .join("")}
+        </div>
+      </div>
+
       <div class="bg-cyber-panel/60 border border-cyber-cyan/30 p-5">
         <div class="text-sm text-cyber-cyan mb-3">TOGGLE HOTKEY</div>
         <div class="flex items-center gap-3">
-          <input data-action="hotkey" value="${p.hotkeyToggle}" maxlength="12"
-            class="bg-black/40 border border-cyber-cyan/40 text-cyber-cyan px-3 py-2 text-sm w-40 outline-none focus:border-cyber-cyan" />
-          <span class="text-[11px] text-gray-500">Global hotkey registration is not implemented yet; use this toggle.</span>
+          <input data-action="hotkey" value="${p.hotkeyToggle}" maxlength="32"
+            class="bg-black/40 border border-cyber-cyan/40 text-cyber-cyan px-3 py-2 text-sm w-48 outline-none focus:border-cyber-cyan" />
+          <span class="text-[11px] text-gray-500">Global shortcut. Examples: F11, Ctrl+Shift+Z.</span>
         </div>
       </div>
     `
@@ -501,11 +548,13 @@ function renderLayerCard(): string {
 
   const badge = layer.active
     ? '<span class="text-cyber-green">ACTIVE</span>'
-    : layer.installedForGames
-      ? '<span class="text-cyber-orange">READY</span>'
-      : layer.installed
-        ? '<span class="text-cyber-orange">AVAILABLE</span>'
-        : '<span class="text-cyber-pink">NOT FOUND</span>';
+    : layer.updateAvailable
+      ? '<span class="text-cyber-magenta">UPDATE</span>'
+      : layer.installedForGames
+        ? '<span class="text-cyber-orange">READY</span>'
+        : layer.installed
+          ? '<span class="text-cyber-orange">AVAILABLE</span>'
+          : '<span class="text-cyber-pink">NOT FOUND</span>';
 
   const stats = layer.stats;
   const statsHtml = stats && stats.enabled
@@ -525,8 +574,13 @@ function renderLayerCard(): string {
     ? `<div class="mt-2 text-[11px] text-gray-500 break-all">${layer.sourceDir}</div>`
     : "";
 
-  const installBtn = layer.installed && !layer.installedForGames
-    ? '<button data-action="install-layer" class="px-3 py-1 border border-cyber-magenta/50 text-cyber-magenta text-xs hover:bg-cyber-magenta/10 hover:shadow-neon-magenta transition-all">INSTALL SYSTEM-WIDE</button>'
+  const installBtn = layer.installed && layer.updateAvailable
+    ? '<button data-action="update-layer" class="px-3 py-1 border border-cyber-magenta/50 text-cyber-magenta text-xs hover:bg-cyber-magenta/10 hover:shadow-neon-magenta transition-all">UPDATE SYSTEM-WIDE</button>'
+    : layer.installed && !layer.installedForGames
+      ? '<button data-action="install-layer" class="px-3 py-1 border border-cyber-magenta/50 text-cyber-magenta text-xs hover:bg-cyber-magenta/10 hover:shadow-neon-magenta transition-all">INSTALL SYSTEM-WIDE</button>'
+      : "";
+  const uninstallBtn = layer.managedInstall
+    ? '<button data-action="uninstall-layer" class="px-3 py-1 border border-cyber-pink/50 text-cyber-pink text-xs hover:bg-cyber-pink/10 transition-all">UNINSTALL</button>'
     : "";
 
   return shell(`
@@ -539,6 +593,7 @@ function renderLayerCard(): string {
       <div class="mt-3 flex flex-wrap gap-2">
         <button data-action="refresh-layer" class="px-3 py-1 border border-cyber-cyan/50 text-cyber-cyan text-xs hover:bg-cyber-cyan/10 hover:shadow-neon-cyan transition-all">REFRESH</button>
         ${installBtn}
+        ${uninstallBtn}
       </div>`);
 }
 
@@ -673,6 +728,9 @@ async function syncRuntimeProfile(): Promise<void> {
       sharpness: p.sharpness,
       frameGeneration: p.frameGeneration,
       overlayEnabled: p.overlayEnabled,
+      overlayShowFps: p.overlayShowFps,
+      overlayShowScale: p.overlayShowScale,
+      overlayPosition: p.overlayPosition,
     });
     if (state.runtime.state === "failed") toast(state.runtime.message);
     render();
@@ -749,6 +807,9 @@ async function handleAction(el: HTMLElement): Promise<void> {
           sharpness: p.sharpness,
           frameGeneration: p.frameGeneration,
           overlayEnabled: p.overlayEnabled,
+          overlayShowFps: p.overlayShowFps,
+          overlayShowScale: p.overlayShowScale,
+          overlayPosition: p.overlayPosition,
         });
         if (state.runtime.state === "failed") toast(state.runtime.message);
         else toast(`Applied to ${game.name}`);
@@ -787,9 +848,33 @@ async function handleAction(el: HTMLElement): Promise<void> {
       break;
     }
     case "hotkey": {
-      const value = (el as HTMLInputElement).value;
-      await persistActive((p) => (p.hotkeyToggle = value));
-      toast(`Hotkey set to ${value}`);
+      const value = (el as HTMLInputElement).value.trim();
+      if (!value) {
+        toast("Hotkey cannot be empty");
+        render();
+        return;
+      }
+      try {
+        await api.setGlobalHotkey(value);
+        await persistActive((p) => (p.hotkeyToggle = value));
+        toast(`Hotkey set to ${value}`);
+      } catch (e) {
+        toast(`Hotkey failed: ${e}`);
+        render();
+      }
+      break;
+    }
+    case "toggle-overlay-fps": {
+      await persistActive((p) => (p.overlayShowFps = !p.overlayShowFps));
+      break;
+    }
+    case "toggle-overlay-scale": {
+      await persistActive((p) => (p.overlayShowScale = !p.overlayShowScale));
+      break;
+    }
+    case "set-overlay-position": {
+      const value = el.dataset.value!;
+      await persistActive((p) => (p.overlayPosition = value));
       break;
     }
     case "new-profile": {
@@ -803,6 +888,9 @@ async function handleAction(el: HTMLElement): Promise<void> {
         frameGeneration: false,
         frameGenMultiplier: 2,
         overlayEnabled: true,
+        overlayShowFps: true,
+        overlayShowScale: true,
+        overlayPosition: "bottom-left",
         hotkeyToggle: "F11",
       };
       const data = await api.saveProfile(profile);
@@ -815,6 +903,14 @@ async function handleAction(el: HTMLElement): Promise<void> {
       const data = await api.setActiveProfile(el.dataset.id!);
       state.profiles = data.profiles;
       state.activeProfileId = data.activeProfileId;
+      const profile = activeProfile();
+      if (profile) {
+        try {
+          await api.setGlobalHotkey(profile.hotkeyToggle);
+        } catch (e) {
+          toast(`Hotkey failed: ${e}`);
+        }
+      }
       scheduleRuntimeSync();
       toast("Profile activated");
       break;
@@ -832,12 +928,24 @@ async function handleAction(el: HTMLElement): Promise<void> {
       toast(state.layer.installed ? "Layer status refreshed" : "Layer not found");
       break;
     }
-    case "install-layer": {
+    case "install-layer":
+    case "update-layer": {
       try {
         state.layer = await api.installLayer();
         toast("Layer installed system-wide");
+        render();
       } catch (e) {
         toast(`Install failed: ${e}`);
+      }
+      break;
+    }
+    case "uninstall-layer": {
+      try {
+        state.layer = await api.uninstallLayer();
+        toast("Layer removed from the system-wide install directory");
+        render();
+      } catch (e) {
+        toast(`Uninstall failed: ${e}`);
       }
       break;
     }
@@ -866,6 +974,18 @@ async function init(): Promise<void> {
     state.gpus = gpus;
     state.runtime = runtime;
     state.layer = layer;
+    await listen<RuntimeStatus>("runtime-status", (event) => {
+      state.runtime = event.payload;
+      render();
+    });
+    const profile = activeProfile();
+    if (profile) {
+      try {
+        await api.setGlobalHotkey(profile.hotkeyToggle);
+      } catch (e) {
+        console.warn("global hotkey:", e);
+      }
+    }
     render();
   } catch (e) {
     toast(`Init error: ${e}`);

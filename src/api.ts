@@ -34,6 +34,9 @@ export interface Profile {
   frameGeneration: boolean;
   frameGenMultiplier: number;
   overlayEnabled: boolean;
+  overlayShowFps: boolean;
+  overlayShowScale: boolean;
+  overlayPosition: string;
   hotkeyToggle: string;
 }
 
@@ -60,6 +63,8 @@ export interface LayerStats {
 export interface LayerStatus {
   installed: boolean;
   installedForGames: boolean;
+  managedInstall: boolean;
+  updateAvailable: boolean;
   devBuild: boolean;
   manifestPath: string | null;
   libraryPath: string | null;
@@ -81,6 +86,9 @@ export interface RuntimeStatus {
   sharpness: number;
   frameGeneration: boolean;
   overlayEnabled: boolean;
+  overlayShowFps: boolean;
+  overlayShowScale: boolean;
+  overlayPosition: string;
   injectedAt: number | null;
   message: string;
 }
@@ -97,6 +105,9 @@ export const api = {
   getRuntimeStatus: () => invoke<RuntimeStatus>("get_runtime_status"),
   getLayerStatus: () => invoke<LayerStatus>("get_layer_status"),
   installLayer: () => invoke<LayerStatus>("install_layer"),
+  uninstallLayer: () => invoke<LayerStatus>("uninstall_layer"),
+  setGlobalHotkey: (accelerator: string) =>
+    invoke<void>("set_global_hotkey", { accelerator }),
   attachToGame: (args: {
     pid: number;
     gameName: string;
@@ -105,6 +116,9 @@ export const api = {
     sharpness: number;
     frameGeneration: boolean;
     overlayEnabled: boolean;
+    overlayShowFps: boolean;
+    overlayShowScale: boolean;
+    overlayPosition: string;
   }) => invoke<RuntimeStatus>("attach_to_game", args),
   detachFromGame: () => invoke<RuntimeStatus>("detach_from_game"),
   setOverlayEnabled: (enabled: boolean) =>

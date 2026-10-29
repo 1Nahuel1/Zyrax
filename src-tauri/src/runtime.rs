@@ -23,6 +23,9 @@ pub struct RuntimeStatus {
     pub sharpness: f32,
     pub frame_generation: bool,
     pub overlay_enabled: bool,
+    pub overlay_show_fps: bool,
+    pub overlay_show_scale: bool,
+    pub overlay_position: String,
     pub injected_at: Option<u64>,
     pub message: String,
 }
@@ -38,6 +41,9 @@ impl Default for RuntimeStatus {
             sharpness: 0.5,
             frame_generation: false,
             overlay_enabled: false,
+            overlay_show_fps: true,
+            overlay_show_scale: true,
+            overlay_position: "bottom-left".into(),
             injected_at: None,
             message: "Ready. Select a game to attach Zyrax.".into(),
         }
@@ -71,6 +77,9 @@ pub fn attach_to_game(
     sharpness: f32,
     frame_generation: bool,
     overlay_enabled: bool,
+    overlay_show_fps: bool,
+    overlay_show_scale: bool,
+    overlay_position: String,
 ) -> RuntimeStatus {
     let mut guard = state.status.lock().unwrap();
 
@@ -96,6 +105,13 @@ pub fn attach_to_game(
     } else {
         0.5
     };
+    let overlay_position = match overlay_position.to_ascii_lowercase().as_str() {
+        "top-left" => "top-left",
+        "bottom-right" => "bottom-right",
+        "top-right" => "top-right",
+        _ => "bottom-left",
+    }
+    .to_string();
 
     // Verify the target process is still alive before attaching.
     let mut sys = System::new();
@@ -128,6 +144,9 @@ pub fn attach_to_game(
         scale_factor,
         sharpness,
         overlay_enabled,
+        overlay_show_fps,
+        overlay_show_scale,
+        &overlay_position,
         frame_generation,
     ) {
         *guard = RuntimeStatus {
@@ -149,6 +168,9 @@ pub fn attach_to_game(
         sharpness,
         frame_generation,
         overlay_enabled,
+        overlay_show_fps,
+        overlay_show_scale,
+        overlay_position,
         injected_at: Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -174,6 +196,9 @@ pub fn detach_from_game(state: tauri::State<RuntimeState>) -> RuntimeStatus {
             guard.scale_factor,
             guard.sharpness,
             guard.overlay_enabled,
+            guard.overlay_show_fps,
+            guard.overlay_show_scale,
+            &guard.overlay_position,
             guard.frame_generation,
         );
     }
@@ -196,6 +221,9 @@ pub fn set_overlay_enabled(state: tauri::State<RuntimeState>, enabled: bool) -> 
                 guard.scale_factor,
                 guard.sharpness,
                 enabled,
+                guard.overlay_show_fps,
+                guard.overlay_show_scale,
+                &guard.overlay_position,
                 guard.frame_generation,
             ) {
                 guard.message = format!("Overlay toggled, but layer update failed: {e}");
@@ -204,4 +232,42 @@ pub fn set_overlay_enabled(state: tauri::State<RuntimeState>, enabled: bool) -> 
         }
     }
     guard.clone()
+}
+
+pub(crate) fn toggle_overlay(app: &tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+
+    let state = app.state::<RuntimeState>();
+    let mut guard = state.status.lock().unwrap();
+    if guard.state != HookState::Active {
+        guard.message = "Hotkey pressed, but no game is attached.".into();
+        let status = guard.clone();
+        drop(guard);
+        let _ = app.emit("runtime-status", status);
+        return;
+    }
+
+    let enabled = !guard.overlay_enabled;
+    guard.overlay_enabled = enabled;
+    if let Some(pid) = guard.pid {
+        match layer::write_layer_control(
+            pid,
+            true,
+            guard.scale_factor,
+            guard.sharpness,
+            enabled,
+            guard.overlay_show_fps,
+            guard.overlay_show_scale,
+            &guard.overlay_position,
+            guard.frame_generation,
+        ) {
+            Ok(()) => {
+                guard.message = format!("Overlay toggled {}.", if enabled { "on" } else { "off" })
+            }
+            Err(e) => guard.message = format!("Overlay toggled, but layer update failed: {e}"),
+        }
+    }
+    let status = guard.clone();
+    drop(guard);
+    let _ = app.emit("runtime-status", status);
 }

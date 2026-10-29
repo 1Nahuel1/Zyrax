@@ -101,7 +101,13 @@ fn detect_gpus_windows() -> Vec<GpuInfo> {
     use std::process::Command;
     let mut gpus = Vec::new();
     let output = Command::new("wmic")
-        .args(["path", "win32_VideoController", "get", "Name,AdapterRAM,DriverVersion", "/format:csv"])
+        .args([
+            "path",
+            "win32_VideoController",
+            "get",
+            "Name,AdapterRAM,DriverVersion",
+            "/format:csv",
+        ])
         .output();
     if let Ok(out) = output {
         let text = String::from_utf8_lossy(&out.stdout);

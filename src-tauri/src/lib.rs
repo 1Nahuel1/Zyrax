@@ -1,5 +1,6 @@
 mod games;
 mod gpu;
+mod hotkeys;
 mod layer;
 mod processes;
 mod profiles;
@@ -15,7 +16,16 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(hotkeys::handle_event)
+                .build(),
+        )
         .manage(RuntimeState::default())
+        .setup(|app| {
+            hotkeys::register_from_profiles(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             processes::list_processes,
             processes::get_process_stats,
@@ -23,6 +33,8 @@ pub fn run() {
             gpu::detect_gpu,
             layer::get_layer_status,
             layer::install_layer,
+            layer::uninstall_layer,
+            hotkeys::set_global_hotkey,
             profiles::get_profiles,
             profiles::save_profile,
             profiles::delete_profile,

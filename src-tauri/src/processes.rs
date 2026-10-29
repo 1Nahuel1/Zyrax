@@ -60,9 +60,7 @@ pub fn list_processes() -> Vec<RunningProcess> {
             Some(RunningProcess {
                 pid: pid.as_u32(),
                 name,
-                exe: proc_
-                    .exe()
-                    .map(|p| p.to_string_lossy().to_string()),
+                exe: proc_.exe().map(|p| p.to_string_lossy().to_string()),
                 memory_mb: proc_.memory() / (1024 * 1024),
                 cpu_usage: proc_.cpu_usage(),
             })

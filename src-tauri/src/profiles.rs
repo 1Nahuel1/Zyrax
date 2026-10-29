@@ -15,7 +15,21 @@ pub struct Profile {
     pub frame_generation: bool,
     pub frame_gen_multiplier: u8,
     pub overlay_enabled: bool,
+    #[serde(default = "default_true")]
+    pub overlay_show_fps: bool,
+    #[serde(default = "default_true")]
+    pub overlay_show_scale: bool,
+    #[serde(default = "default_overlay_position")]
+    pub overlay_position: String,
     pub hotkey_toggle: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_overlay_position() -> String {
+    "bottom-left".into()
 }
 
 impl Default for Profile {
@@ -30,6 +44,9 @@ impl Default for Profile {
             frame_generation: false,
             frame_gen_multiplier: 2,
             overlay_enabled: true,
+            overlay_show_fps: true,
+            overlay_show_scale: true,
+            overlay_position: "bottom-left".into(),
             hotkey_toggle: "F11".into(),
         }
     }
@@ -51,7 +68,7 @@ fn data_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("zyrax.json"))
 }
 
-fn load(app: &tauri::AppHandle) -> AppData {
+pub(crate) fn load(app: &tauri::AppHandle) -> AppData {
     let Ok(path) = data_path(app) else {
         return AppData::default();
     };
@@ -65,6 +82,16 @@ fn save(app: &tauri::AppHandle, data: &AppData) -> Result<(), String> {
     let path = data_path(app)?;
     let raw = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
     fs::write(path, raw).map_err(|e| e.to_string())
+}
+
+pub(crate) fn active_hotkey(app: &tauri::AppHandle) -> Option<String> {
+    let data = load(app);
+    let active = data
+        .active_profile_id
+        .as_deref()
+        .and_then(|id| data.profiles.iter().find(|p| p.id == id))
+        .or_else(|| data.profiles.first())?;
+    Some(active.hotkey_toggle.clone())
 }
 
 #[tauri::command]

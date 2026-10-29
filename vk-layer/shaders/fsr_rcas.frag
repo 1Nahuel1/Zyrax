@@ -16,6 +16,7 @@ layout(push_constant) uniform PC {
     uvec4 con3;
     uvec4 rcas;
     uvec4 ui;
+    uvec4 ui2;
 } pc;
 
 AF4 FsrRcasLoadF(ASU2 p) {
@@ -49,25 +50,45 @@ void main() {
     FsrRcasF(r, g, b, AU2(gl_FragCoord.xy), pc.rcas);
 
     vec3 col = vec3(r, g, b);
-    if (pc.ui.x != 0u) {
+    uint flags = pc.ui.w;
+    bool showFps = (flags & 1u) != 0u;
+    bool showScale = (flags & 2u) != 0u;
+    if (pc.ui.x != 0u && (showFps || showScale)) {
         int chars[15];
-        chars[0] = 70; chars[1] = 80; chars[2] = 83; chars[3] = 32; // "FPS "
+        int count = 0;
         int f = min(int(pc.ui.y), 999);
-        chars[4] = 48 + (f / 100) % 10;
-        chars[5] = 48 + (f / 10) % 10;
-        chars[6] = 48 + f % 10;
-        chars[7] = 32; chars[8] = 83; chars[9] = 67; chars[10] = 76; chars[11] = 32; // " SCL "
         int s = min(int(pc.ui.z), 999);
-        chars[12] = 48 + (s / 100) % 10;
-        chars[13] = 48 + (s / 10) % 10;
-        chars[14] = 48 + s % 10;
+
+        if (showFps) {
+            chars[count++] = 70; chars[count++] = 80; chars[count++] = 83; chars[count++] = 32; // "FPS "
+            chars[count++] = 48 + (f / 100) % 10;
+            chars[count++] = 48 + (f / 10) % 10;
+            chars[count++] = 48 + f % 10;
+        }
+        if (showScale) {
+            if (showFps) chars[count++] = 32;
+            chars[count++] = 83; chars[count++] = 67; chars[count++] = 76; chars[count++] = 32; // "SCL "
+            chars[count++] = 48 + (s / 100) % 10;
+            chars[count++] = 48 + (s / 10) % 10;
+            chars[count++] = 48 + s % 10;
+        }
 
         float px = 3.0;
         float cellW = 5.0 * px + 3.0;
-        vec2 q = vec2(gl_FragCoord.x - 12.0, gl_FragCoord.y - 12.0);
+        float textW = float(count) * cellW - 3.0;
+        float textH = 7.0 * px;
+        vec2 size = vec2(float(pc.ui2.x), float(pc.ui2.y));
+        float margin = 12.0;
+        int pos = int((flags >> 2u) & 3u);
+        vec2 origin = vec2(margin, margin);
+        if (pos == 1) origin = vec2(margin, size.y - textH - margin);
+        else if (pos == 2) origin = vec2(size.x - textW - margin, margin);
+        else if (pos == 3) origin = vec2(size.x - textW - margin, size.y - textH - margin);
+
+        vec2 q = gl_FragCoord.xy - origin;
         if (q.x >= 0.0 && q.y >= 0.0) {
             int idx = int(floor(q.x / cellW));
-            if (idx < 15) {
+            if (idx < count) {
                 float lx = q.x - float(idx) * cellW;
                 if (lx < 5.0 * px) {
                     int gx = int(floor(lx / px));

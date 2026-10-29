@@ -24,9 +24,13 @@ cyberpunk UI built with Tauri + Rust and a Vite/TypeScript frontend.
 - **Frame generation** — UI and profile plumbing are in place (the Linux layer
   does not synthesize frames yet).
 - **In-game overlay** — optional 5x7 HUD drawn by the FSR shader with live FPS
-  and active scale.
+  and active scale. Pick which elements to show and place it in any corner.
+- **Global hotkey** — configurable system-wide shortcut (default `F11`) to
+  toggle the overlay while a game is attached.
 - **Profile manager** — create, activate and delete per-game configuration
   profiles (persisted to disk).
+- **Layer management** — install, update and uninstall the bundled Vulkan layer
+  from Settings, with out-of-date detection.
 - **Cross-platform shell** — Windows and Linux via Tauri 2.
 
 ## Tech stack
@@ -52,7 +56,10 @@ process through a small control file, pushes scale/sharpness changes live, and
 reads frame stats from it in **Settings**.
 
 The Windows DXGI hook, DLSS and real frame generation are **not implemented**
-yet. The layer only targets Vulkan on Linux.
+yet. The layer only targets Vulkan on Linux. These are integration-level
+features, not something a present-only layer can provide: DXGI needs a Windows
+injection path, DLSS needs the NVIDIA NGX SDK and per-game motion vectors, and
+real frame generation needs app-level depth/motion data and swapchain pacing.
 
 ## Vulkan layer (Linux, alpha)
 
@@ -62,7 +69,9 @@ Requirements to build from source: `g++`, `glslangValidator`, `spirv-val`,
 `bun run tauri dev` and `bun run tauri build` build the layer automatically on
 Linux (`scripts/build-layer.mjs`) and bundle `libzyrax_fsr.so`, its manifest and
 the shader sources with the app. Use **INSTALL SYSTEM-WIDE** in Settings to copy
-it into the Vulkan implicit-layer directory; no manual scripts are needed.
+it into the Vulkan implicit-layer directory; no manual scripts are needed. When a
+new build is bundled, Settings shows **UPDATE SYSTEM-WIDE**, and **UNINSTALL**
+removes the copy managed by the app.
 
 To build or install only the layer:
 
@@ -197,7 +206,19 @@ src-tauri/tauri.linux.conf.json  # bundles the layer as a Linux resource
 - [ ] DLSS integration
 - [ ] Frame generation pipeline
 - [x] In-game FPS/scale HUD (drawn by the FSR shader)
-- [ ] Configurable overlay elements and global hotkeys
+- [x] Configurable overlay elements, position and global hotkey
+- [x] Layer install, update and uninstall from the app
+- [x] CI for Linux packages and Windows compile checks
+
+## CI and releases
+
+`.github/workflows/ci.yml` builds the layer, runs TypeScript and Rust tests,
+produces a Linux `.deb`, and compile-checks Windows. `.github/workflows/release.yml`
+creates draft releases for tags matching `v*` with Linux and Windows installers.
+
+Packages are currently unsigned. To sign them, provide the platform certificate
+secrets to the release workflow (Windows code-signing certificate / Linux GPG
+key) or configure Tauri's signing options; no certificate is committed here.
 
 ## Contributing
 

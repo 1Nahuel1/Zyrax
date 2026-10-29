@@ -41,6 +41,8 @@ pub struct LayerStats {
 pub struct LayerStatus {
     pub installed: bool,
     pub installed_for_games: bool,
+    pub managed_install: bool,
+    pub update_available: bool,
     pub dev_build: bool,
     pub manifest_path: Option<String>,
     pub library_path: Option<String>,
@@ -103,6 +105,33 @@ fn candidate_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+fn managed_install_dir() -> Result<PathBuf, String> {
+    dirs::data_dir()
+        .map(|dir| dir.join("vulkan/implicit_layer.d"))
+        .ok_or_else(|| "Could not resolve the user data directory".to_string())
+}
+
+fn installed_at(dir: &Path) -> bool {
+    dir.join(MANIFEST_NAME).is_file() && dir.join(LIBRARY_NAME).is_file()
+}
+
+fn same_bytes(left: &Path, right: &Path) -> bool {
+    match (fs::read(left), fs::read(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn update_available(manifest: &Path, library: &Path) -> bool {
+    let Ok(dir) = managed_install_dir() else {
+        return false;
+    };
+    if !installed_at(&dir) {
+        return false;
+    }
+    !same_bytes(manifest, &dir.join(MANIFEST_NAME)) || !same_bytes(library, &dir.join(LIBRARY_NAME))
+}
+
 fn bundled_layer_dirs(app: &tauri::AppHandle) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
@@ -148,6 +177,9 @@ pub fn write_layer_control(
     scale_factor: f32,
     sharpness: f32,
     overlay: bool,
+    overlay_show_fps: bool,
+    overlay_show_scale: bool,
+    overlay_position: &str,
     frame_generation: bool,
 ) -> Result<(), String> {
     #[cfg(not(target_os = "linux"))]
@@ -158,6 +190,9 @@ pub fn write_layer_control(
             scale_factor,
             sharpness,
             overlay,
+            overlay_show_fps,
+            overlay_show_scale,
+            overlay_position,
             frame_generation,
         );
         return Err("The Vulkan layer is only available on Linux".to_string());
@@ -169,13 +204,22 @@ pub fn write_layer_control(
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         let scale = scale_factor.clamp(1.0, 4.0);
         let sharp = sharpness.clamp(0.0, 1.0);
+        let position = match overlay_position.to_ascii_lowercase().as_str() {
+            "top-left" => 1,
+            "bottom-right" => 2,
+            "top-right" => 3,
+            _ => 0,
+        };
         let body = format!(
-            "version=1\nenabled={}\npid={}\nscale={:.4}\nsharpness={:.4}\noverlay={}\nframe_gen={}\n",
+            "version=1\nenabled={}\npid={}\nscale={:.4}\nsharpness={:.4}\noverlay={}\noverlay_fps={}\noverlay_scale={}\noverlay_pos={}\nframe_gen={}\n",
             enabled as u8,
             pid,
             scale,
             sharp,
             overlay as u8,
+            overlay_show_fps as u8,
+            overlay_show_scale as u8,
+            position,
             frame_generation as u8
         );
         fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -215,44 +259,55 @@ pub fn get_layer_status(app: tauri::AppHandle) -> LayerStatus {
         .map(|s| s.enabled && now_unix() - s.timestamp <= 3)
         .unwrap_or(false);
     let installed_for_games = layer_installed_for_games();
+    let managed_install = managed_install_dir()
+        .map(|dir| installed_at(&dir))
+        .unwrap_or(false);
+    let found = find_layer(&app);
+    let update_available = found
+        .as_ref()
+        .map(|(manifest, library)| update_available(manifest, library))
+        .unwrap_or(false);
 
-    let (installed, dev_build, manifest_path, library_path, source_dir, message) =
-        match find_layer(&app) {
-            Some((manifest, library)) => {
-                let dir = manifest.parent().map(Path::to_path_buf);
-                let dev = dir
-                    .as_ref()
-                    .map(|d| d.ends_with("vk-layer/build"))
-                    .unwrap_or(false);
-                let message = if installed_for_games {
-                    "Layer installed. Attach a running Vulkan game from the dashboard."
-                } else if dev {
-                    "Layer compiled in the repository. Install it to enable it system-wide."
-                } else {
-                    "Layer bundled with Zyrax. Install it to enable it system-wide."
-                };
-                (
-                    true,
-                    dev,
-                    Some(manifest.to_string_lossy().to_string()),
-                    Some(library.to_string_lossy().to_string()),
-                    dir.map(|d| d.to_string_lossy().to_string()),
-                    message,
-                )
-            }
-            None => (
-                false,
-                false,
-                None,
-                None,
-                None,
-                "Layer not found. Reinstall Zyrax or build it with vk-layer/build.sh.",
-            ),
-        };
+    let (installed, dev_build, manifest_path, library_path, source_dir, message) = match found {
+        Some((manifest, library)) => {
+            let dir = manifest.parent().map(Path::to_path_buf);
+            let dev = dir
+                .as_ref()
+                .map(|d| d.ends_with("vk-layer/build"))
+                .unwrap_or(false);
+            let message = if update_available {
+                "A newer bundled layer is available. Update it system-wide."
+            } else if installed_for_games {
+                "Layer installed. Attach a running Vulkan game from the dashboard."
+            } else if dev {
+                "Layer compiled in the repository. Install it to enable it system-wide."
+            } else {
+                "Layer bundled with Zyrax. Install it to enable it system-wide."
+            };
+            (
+                true,
+                dev,
+                Some(manifest.to_string_lossy().to_string()),
+                Some(library.to_string_lossy().to_string()),
+                dir.map(|d| d.to_string_lossy().to_string()),
+                message,
+            )
+        }
+        None => (
+            false,
+            false,
+            None,
+            None,
+            None,
+            "Layer not found. Reinstall Zyrax or build it with vk-layer/build.sh.",
+        ),
+    };
 
     LayerStatus {
         installed,
         installed_for_games,
+        managed_install,
+        update_available,
         dev_build,
         manifest_path,
         library_path,
@@ -270,9 +325,7 @@ pub fn install_layer(app: tauri::AppHandle) -> Result<LayerStatus, String> {
         "No layer found. Reinstall Zyrax or build it with vk-layer/build.sh.".to_string()
     })?;
 
-    let target = dirs::data_dir()
-        .ok_or_else(|| "Could not resolve the user data directory".to_string())?
-        .join("vulkan/implicit_layer.d");
+    let target = managed_install_dir()?;
 
     fs::create_dir_all(&target).map_err(|e| format!("create {}: {e}", target.display()))?;
 
@@ -289,6 +342,23 @@ pub fn install_layer(app: tauri::AppHandle) -> Result<LayerStatus, String> {
     Ok(get_layer_status(app))
 }
 
+#[tauri::command]
+pub fn uninstall_layer(app: tauri::AppHandle) -> Result<LayerStatus, String> {
+    let target = managed_install_dir()?;
+    let mut removed = false;
+    for name in [MANIFEST_NAME, LIBRARY_NAME] {
+        let path = target.join(name);
+        if path.is_file() {
+            fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+            removed = true;
+        }
+    }
+    if !removed {
+        return Err(format!("Layer is not installed in {}", target.display()));
+    }
+    Ok(get_layer_status(app))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,16 +371,41 @@ mod tests {
         let path = dir.join("control");
         std::env::set_var("ZYRAX_FSR_CONTROL", &path);
 
-        write_layer_control(4242, true, 1.75, 0.65, true, false).unwrap();
+        write_layer_control(
+            4242,
+            true,
+            1.75,
+            0.65,
+            true,
+            true,
+            false,
+            "top-right",
+            false,
+        )
+        .unwrap();
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("enabled=1"));
         assert!(body.contains("pid=4242"));
         assert!(body.contains("scale=1.7500"));
         assert!(body.contains("sharpness=0.6500"));
         assert!(body.contains("overlay=1"));
+        assert!(body.contains("overlay_fps=1"));
+        assert!(body.contains("overlay_scale=0"));
+        assert!(body.contains("overlay_pos=3"));
         assert!(body.contains("frame_gen=0"));
 
-        write_layer_control(4242, false, 1.0, 0.0, false, false).unwrap();
+        write_layer_control(
+            4242,
+            false,
+            1.0,
+            0.0,
+            false,
+            true,
+            true,
+            "bottom-left",
+            false,
+        )
+        .unwrap();
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("enabled=0"));
 
