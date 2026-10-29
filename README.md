@@ -56,7 +56,15 @@ yet. The layer only targets Vulkan on Linux.
 
 ## Vulkan layer (Linux, alpha)
 
-Requirements: `g++`, `glslangValidator`, `spirv-val`, `xxd` and Vulkan headers.
+Requirements to build from source: `g++`, `glslangValidator`, `spirv-val`,
+`xxd` and Vulkan headers.
+
+`bun run tauri dev` and `bun run tauri build` build the layer automatically on
+Linux (`scripts/build-layer.mjs`) and bundle `libzyrax_fsr.so`, its manifest and
+the shader sources with the app. Use **INSTALL SYSTEM-WIDE** in Settings to copy
+it into the Vulkan implicit-layer directory; no manual scripts are needed.
+
+To build or install only the layer:
 
 ```bash
 cd vk-layer
@@ -162,6 +170,8 @@ vk-layer/                # Linux Vulkan implicit layer (C++)
   shaders/               # full-screen triangle + FSR EASU/RCAS shaders
   build.sh               # shader compile + shared library build
   install.sh             # per-user install into ~/.local/share/vulkan
+scripts/build-layer.mjs  # builds the layer before Tauri dev/build
+src-tauri/tauri.linux.conf.json  # bundles the layer as a Linux resource
 ```
 
 ### How upscaling is applied (design)
@@ -182,6 +192,7 @@ vk-layer/                # Linux Vulkan implicit layer (C++)
 - [x] Profile management with persistence
 - [x] Runtime hook lifecycle & status
 - [x] Vulkan implicit layer (Linux) with EASU + RCAS resolution-changing FSR upscale
+- [x] Automatic layer build + resource bundling in Tauri (Linux)
 - [ ] DXGI swapchain hook (Windows) with FSR
 - [ ] DLSS integration
 - [ ] Frame generation pipeline

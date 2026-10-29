@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "../vk-layer/build/libzyrax_fsr.so": "vk-layer/libzyrax_fsr.so",
+      "../vk-layer/build/VkLayer_zyrax_fsr.json": "vk-layer/VkLayer_zyrax_fsr.json",
+      "../vk-layer/shaders/": "vk-layer/shaders/"
+    }
+  }
+}

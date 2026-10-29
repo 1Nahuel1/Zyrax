@@ -59,6 +59,7 @@ export interface LayerStats {
 
 export interface LayerStatus {
   installed: boolean;
+  installedForGames: boolean;
   devBuild: boolean;
   manifestPath: string | null;
   libraryPath: string | null;

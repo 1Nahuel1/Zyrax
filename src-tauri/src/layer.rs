@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
 const MANIFEST_NAME: &str = "VkLayer_zyrax_fsr.json";
 const LIBRARY_NAME: &str = "libzyrax_fsr.so";
@@ -39,6 +40,7 @@ pub struct LayerStats {
 #[serde(rename_all = "camelCase")]
 pub struct LayerStatus {
     pub installed: bool,
+    pub installed_for_games: bool,
     pub dev_build: bool,
     pub manifest_path: Option<String>,
     pub library_path: Option<String>,
@@ -101,8 +103,24 @@ fn candidate_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn find_layer() -> Option<(PathBuf, PathBuf)> {
-    for dir in candidate_dirs() {
+fn bundled_layer_dirs(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        dirs.push(resource_dir.join("vk-layer"));
+        dirs.push(resource_dir);
+    }
+    dirs
+}
+
+fn find_layer(app: &tauri::AppHandle) -> Option<(PathBuf, PathBuf)> {
+    let mut dirs = Vec::new();
+    if let Some(explicit) = std::env::var_os("ZYRAX_FSR_LAYER_DIR") {
+        dirs.push(PathBuf::from(explicit));
+    }
+    dirs.extend(bundled_layer_dirs(app));
+    dirs.extend(candidate_dirs());
+
+    for dir in dirs {
         let manifest = dir.join(MANIFEST_NAME);
         if manifest.is_file() {
             let library = dir.join(LIBRARY_NAME);
@@ -189,26 +207,29 @@ fn now_unix() -> i64 {
 }
 
 #[tauri::command]
-pub fn get_layer_status() -> LayerStatus {
+pub fn get_layer_status(app: tauri::AppHandle) -> LayerStatus {
     let stats_path = stats_path();
     let stats = read_stats(&stats_path);
     let active = stats
         .as_ref()
         .map(|s| s.enabled && now_unix() - s.timestamp <= 3)
         .unwrap_or(false);
+    let installed_for_games = layer_installed_for_games();
 
     let (installed, dev_build, manifest_path, library_path, source_dir, message) =
-        match find_layer() {
+        match find_layer(&app) {
             Some((manifest, library)) => {
                 let dir = manifest.parent().map(Path::to_path_buf);
                 let dev = dir
                     .as_ref()
                     .map(|d| d.ends_with("vk-layer/build"))
                     .unwrap_or(false);
-                let message = if dev {
+                let message = if installed_for_games {
+                    "Layer installed. Attach a running Vulkan game from the dashboard."
+                } else if dev {
                     "Layer compiled in the repository. Install it to enable it system-wide."
                 } else {
-                    "Layer installed. Attach a running Vulkan game from the dashboard."
+                    "Layer bundled with Zyrax. Install it to enable it system-wide."
                 };
                 (
                     true,
@@ -225,12 +246,13 @@ pub fn get_layer_status() -> LayerStatus {
                 None,
                 None,
                 None,
-                "Layer not found. Build it with vk-layer/build.sh.",
+                "Layer not found. Reinstall Zyrax or build it with vk-layer/build.sh.",
             ),
         };
 
     LayerStatus {
         installed,
+        installed_for_games,
         dev_build,
         manifest_path,
         library_path,
@@ -243,9 +265,9 @@ pub fn get_layer_status() -> LayerStatus {
 }
 
 #[tauri::command]
-pub fn install_layer() -> Result<LayerStatus, String> {
-    let (manifest, library) = find_layer().ok_or_else(|| {
-        "No built layer found. Run vk-layer/build.sh inside the repository first.".to_string()
+pub fn install_layer(app: tauri::AppHandle) -> Result<LayerStatus, String> {
+    let (manifest, library) = find_layer(&app).ok_or_else(|| {
+        "No layer found. Reinstall Zyrax or build it with vk-layer/build.sh.".to_string()
     })?;
 
     let target = dirs::data_dir()
@@ -264,7 +286,7 @@ pub fn install_layer() -> Result<LayerStatus, String> {
         fs::copy(&library, &target_library).map_err(|e| format!("copy library: {e}"))?;
     }
 
-    Ok(get_layer_status())
+    Ok(get_layer_status(app))
 }
 
 #[cfg(test)]

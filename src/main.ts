@@ -501,9 +501,11 @@ function renderLayerCard(): string {
 
   const badge = layer.active
     ? '<span class="text-cyber-green">ACTIVE</span>'
-    : layer.installed
+    : layer.installedForGames
       ? '<span class="text-cyber-orange">READY</span>'
-      : '<span class="text-cyber-pink">NOT FOUND</span>';
+      : layer.installed
+        ? '<span class="text-cyber-orange">AVAILABLE</span>'
+        : '<span class="text-cyber-pink">NOT FOUND</span>';
 
   const stats = layer.stats;
   const statsHtml = stats && stats.enabled
@@ -523,7 +525,7 @@ function renderLayerCard(): string {
     ? `<div class="mt-2 text-[11px] text-gray-500 break-all">${layer.sourceDir}</div>`
     : "";
 
-  const installBtn = layer.devBuild
+  const installBtn = layer.installed && !layer.installedForGames
     ? '<button data-action="install-layer" class="px-3 py-1 border border-cyber-magenta/50 text-cyber-magenta text-xs hover:bg-cyber-magenta/10 hover:shadow-neon-magenta transition-all">INSTALL SYSTEM-WIDE</button>'
     : "";
 
