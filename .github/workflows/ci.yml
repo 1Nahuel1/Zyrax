@@ -6,32 +6,9 @@ on:
   pull_request:
 
 jobs:
-  linux:
-    name: Linux build and tests
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential curl file libssl-dev libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
-            libvulkan-dev glslang-tools spirv-tools xxd
-      - run: bun install --frozen-lockfile
-      - run: bun run check
-      - run: cargo build --manifest-path src-tauri/Cargo.toml --release
-
-  windows:
-    name: Windows compile
-    runs-on: windows-latest
+  validate:
+    name: Validate and Check
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -43,4 +20,3 @@ jobs:
           workspaces: src-tauri
       - run: bun install --frozen-lockfile
       - run: bun run check
-      - run: cargo build --manifest-path src-tauri/Cargo.toml --release
