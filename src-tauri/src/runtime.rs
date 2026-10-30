@@ -62,6 +62,21 @@ impl Default for RuntimeState {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachRequest {
+    pub pid: u32,
+    pub game_name: String,
+    pub upscaler: String,
+    pub scale_factor: f32,
+    pub sharpness: f32,
+    pub frame_generation: bool,
+    pub overlay_enabled: bool,
+    pub overlay_show_fps: bool,
+    pub overlay_show_scale: bool,
+    pub overlay_position: String,
+}
+
 #[tauri::command]
 pub fn get_runtime_status(state: tauri::State<RuntimeState>) -> RuntimeStatus {
     state.status.lock().unwrap().clone()
@@ -70,42 +85,51 @@ pub fn get_runtime_status(state: tauri::State<RuntimeState>) -> RuntimeStatus {
 #[tauri::command]
 pub fn attach_to_game(
     state: tauri::State<RuntimeState>,
-    pid: u32,
-    game_name: String,
-    upscaler: String,
-    scale_factor: f32,
-    sharpness: f32,
-    frame_generation: bool,
-    overlay_enabled: bool,
-    overlay_show_fps: bool,
-    overlay_show_scale: bool,
-    overlay_position: String,
+    request: AttachRequest,
 ) -> RuntimeStatus {
     let mut guard = state.status.lock().unwrap();
 
-    let upscaler = upscaler.trim().to_ascii_lowercase();
+    #[cfg(not(target_os = "linux"))]
+    {
+        *guard = RuntimeStatus {
+            state: HookState::Failed,
+            pid: Some(request.pid),
+            game_name: Some(request.game_name.clone()),
+            message: "The DXGI hook is not implemented; the Zyrax Vulkan layer is Linux-only."
+                .to_string(),
+            ..Default::default()
+        };
+        return guard.clone();
+    }
+
+    let upscaler = request.upscaler.trim().to_ascii_lowercase();
     if upscaler != "fsr" {
         *guard = RuntimeStatus {
             state: HookState::Failed,
-            pid: Some(pid),
-            game_name: Some(game_name),
+            pid: Some(request.pid),
+            game_name: Some(request.game_name),
             message: "Only FSR is implemented by the Linux Vulkan layer. Select FSR.".to_string(),
             ..Default::default()
         };
         return guard.clone();
     }
 
-    let scale_factor = if scale_factor.is_finite() {
-        scale_factor.clamp(1.0, 4.0)
+    // Frame generation is not implemented by the layer. Never attach with it
+    // enabled; fall back to FSR only and warn the user.
+    let frame_generation_requested = request.frame_generation;
+    let frame_generation = false;
+
+    let scale_factor = if request.scale_factor.is_finite() {
+        request.scale_factor.clamp(1.0, 4.0)
     } else {
         1.5
     };
-    let sharpness = if sharpness.is_finite() {
-        sharpness.clamp(0.0, 1.0)
+    let sharpness = if request.sharpness.is_finite() {
+        request.sharpness.clamp(0.0, 1.0)
     } else {
         0.5
     };
-    let overlay_position = match overlay_position.to_ascii_lowercase().as_str() {
+    let overlay_position = match request.overlay_position.to_ascii_lowercase().as_str() {
         "top-left" => "top-left",
         "bottom-right" => "bottom-right",
         "top-right" => "top-right",
@@ -116,12 +140,12 @@ pub fn attach_to_game(
     // Verify the target process is still alive before attaching.
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
-    if sys.process(Pid::from_u32(pid)).is_none() {
+    if sys.process(Pid::from_u32(request.pid)).is_none() {
         *guard = RuntimeStatus {
             state: HookState::Failed,
             pid: None,
             game_name: None,
-            message: format!("Process {pid} is no longer running."),
+            message: format!("Process {} is no longer running.", request.pid),
             ..Default::default()
         };
         return guard.clone();
@@ -130,29 +154,29 @@ pub fn attach_to_game(
     if !layer::layer_installed_for_games() {
         *guard = RuntimeStatus {
             state: HookState::Failed,
-            pid: Some(pid),
-            game_name: Some(game_name),
+            pid: Some(request.pid),
+            game_name: Some(request.game_name),
             message: "Vulkan layer is not installed. Install it in Settings first.".to_string(),
             ..Default::default()
         };
         return guard.clone();
     }
 
-    if let Err(e) = layer::write_layer_control(
-        pid,
-        true,
+    if let Err(e) = layer::write_layer_control(&layer::LayerControl {
+        pid: request.pid,
+        enabled: true,
         scale_factor,
         sharpness,
-        overlay_enabled,
-        overlay_show_fps,
-        overlay_show_scale,
-        &overlay_position,
+        overlay: request.overlay_enabled,
+        overlay_show_fps: request.overlay_show_fps,
+        overlay_show_scale: request.overlay_show_scale,
+        overlay_position: overlay_position.clone(),
         frame_generation,
-    ) {
+    }) {
         *guard = RuntimeStatus {
             state: HookState::Failed,
-            pid: Some(pid),
-            game_name: Some(game_name),
+            pid: Some(request.pid),
+            game_name: Some(request.game_name),
             message: format!("Could not activate the layer: {e}"),
             ..Default::default()
         };
@@ -161,15 +185,15 @@ pub fn attach_to_game(
 
     *guard = RuntimeStatus {
         state: HookState::Active,
-        pid: Some(pid),
-        game_name: Some(game_name.clone()),
+        pid: Some(request.pid),
+        game_name: Some(request.game_name.clone()),
         upscaler: Some(upscaler.clone()),
         scale_factor,
         sharpness,
         frame_generation,
-        overlay_enabled,
-        overlay_show_fps,
-        overlay_show_scale,
+        overlay_enabled: request.overlay_enabled,
+        overlay_show_fps: request.overlay_show_fps,
+        overlay_show_scale: request.overlay_show_scale,
         overlay_position,
         injected_at: Some(
             std::time::SystemTime::now()
@@ -177,11 +201,19 @@ pub fn attach_to_game(
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         ),
-        message: format!(
-            "Attached to {game_name}. Upscaler: {}, x{scale_factor:.2}, FrameGen: {}",
-            upscaler.to_uppercase(),
-            if frame_generation { "ON" } else { "OFF" }
-        ),
+        message: if frame_generation_requested {
+            format!(
+                "Attached to {}. Upscaler: {}, x{scale_factor:.2}. Frame generation is not implemented; attached with FSR only.",
+                request.game_name,
+                upscaler.to_uppercase()
+            )
+        } else {
+            format!(
+                "Attached to {}. Upscaler: {}, x{scale_factor:.2}, FrameGen: OFF",
+                request.game_name,
+                upscaler.to_uppercase()
+            )
+        },
     };
     guard.clone()
 }
@@ -190,17 +222,17 @@ pub fn attach_to_game(
 pub fn detach_from_game(state: tauri::State<RuntimeState>) -> RuntimeStatus {
     let mut guard = state.status.lock().unwrap();
     if let Some(pid) = guard.pid {
-        let _ = layer::write_layer_control(
+        let _ = layer::write_layer_control(&layer::LayerControl {
             pid,
-            false,
-            guard.scale_factor,
-            guard.sharpness,
-            guard.overlay_enabled,
-            guard.overlay_show_fps,
-            guard.overlay_show_scale,
-            &guard.overlay_position,
-            guard.frame_generation,
-        );
+            enabled: false,
+            scale_factor: guard.scale_factor,
+            sharpness: guard.sharpness,
+            overlay: guard.overlay_enabled,
+            overlay_show_fps: guard.overlay_show_fps,
+            overlay_show_scale: guard.overlay_show_scale,
+            overlay_position: guard.overlay_position.clone(),
+            frame_generation: guard.frame_generation,
+        });
     }
     *guard = RuntimeStatus {
         message: "Detached. Hooks released.".into(),
@@ -215,17 +247,17 @@ pub fn set_overlay_enabled(state: tauri::State<RuntimeState>, enabled: bool) -> 
     guard.overlay_enabled = enabled;
     if guard.state == HookState::Active {
         if let Some(pid) = guard.pid {
-            if let Err(e) = layer::write_layer_control(
+            if let Err(e) = layer::write_layer_control(&layer::LayerControl {
                 pid,
-                true,
-                guard.scale_factor,
-                guard.sharpness,
-                enabled,
-                guard.overlay_show_fps,
-                guard.overlay_show_scale,
-                &guard.overlay_position,
-                guard.frame_generation,
-            ) {
+                enabled: true,
+                scale_factor: guard.scale_factor,
+                sharpness: guard.sharpness,
+                overlay: enabled,
+                overlay_show_fps: guard.overlay_show_fps,
+                overlay_show_scale: guard.overlay_show_scale,
+                overlay_position: guard.overlay_position.clone(),
+                frame_generation: guard.frame_generation,
+            }) {
                 guard.message = format!("Overlay toggled, but layer update failed: {e}");
                 return guard.clone();
             }
@@ -250,17 +282,17 @@ pub(crate) fn toggle_overlay(app: &tauri::AppHandle) {
     let enabled = !guard.overlay_enabled;
     guard.overlay_enabled = enabled;
     if let Some(pid) = guard.pid {
-        match layer::write_layer_control(
+        match layer::write_layer_control(&layer::LayerControl {
             pid,
-            true,
-            guard.scale_factor,
-            guard.sharpness,
-            enabled,
-            guard.overlay_show_fps,
-            guard.overlay_show_scale,
-            &guard.overlay_position,
-            guard.frame_generation,
-        ) {
+            enabled: true,
+            scale_factor: guard.scale_factor,
+            sharpness: guard.sharpness,
+            overlay: enabled,
+            overlay_show_fps: guard.overlay_show_fps,
+            overlay_show_scale: guard.overlay_show_scale,
+            overlay_position: guard.overlay_position.clone(),
+            frame_generation: guard.frame_generation,
+        }) {
             Ok(()) => {
                 guard.message = format!("Overlay toggled {}.", if enabled { "on" } else { "off" })
             }

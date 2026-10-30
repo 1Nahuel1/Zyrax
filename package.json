@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "layer:build": "bun scripts/build-layer.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test && cargo test --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "preview": "vite preview",
     "tauri": "tauri"
   },

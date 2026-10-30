@@ -1,15 +1,20 @@
 # Zyrax
 
-> Cyberpunk **upscaling + frame generation** overlay for Windows and Linux, inspired by Lossless Scaling.
+> Cyberpunk **upscaling** overlay for Linux, inspired by Lossless Scaling.
 
 ![status](https://img.shields.io/badge/status-alpha-orange)
 ![license](https://img.shields.io/badge/license-MIT-00fff9)
-![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-ff00ff)
+![platform](https://img.shields.io/badge/platform-Linux-ff00ff)
 
 Zyrax is an open-source desktop app that detects your running games, lets you
-configure spatial upscaling (AMD **FSR**) and AI upscaling (**DLSS**), enable
-**frame generation**, and shows a neon **in-game overlay** — all wrapped in a
-cyberpunk UI built with Tauri + Rust and a Vite/TypeScript frontend.
+configure spatial upscaling (AMD **FSR**), and shows a neon **in-game overlay**
+— all wrapped in a cyberpunk UI built with Tauri + Rust and a Vite/TypeScript
+frontend.
+
+**Not implemented (and not simulated in the UI):** DLSS, the Windows DXGI hook,
+and real frame generation. The Vulkan layer targets Linux only. These features
+appear in the UI as disabled/unavailable, and the backend never attaches with
+frame generation enabled.
 
 ---
 
@@ -18,11 +23,11 @@ cyberpunk UI built with Tauri + Rust and a Vite/TypeScript frontend.
 - **Game detection** — scans running processes and identifies native and
   Proton/Wine titles by executable path heuristics.
 - **GPU detection** — enumerates GPUs, driver and supported graphics APIs
-  (Vulkan, OpenGL, DirectX 11/12, FSR/DLSS).
-- **Upscaling profiles** — choose FSR / DLSS / Off, scale factor and sharpness
-  (FSR is the only backend implemented today).
-- **Frame generation** — UI and profile plumbing are in place (the Linux layer
-  does not synthesize frames yet).
+  (Vulkan, OpenGL on Linux).
+- **Upscaling profiles** — choose FSR / Off, scale factor and sharpness (FSR is
+  the only backend implemented today).
+- **Frame generation** — **not implemented**. The preference can be stored in a
+  profile but is never applied; attaching always falls back to FSR only.
 - **In-game overlay** — optional 5x7 HUD drawn by the FSR shader with live FPS
   and active scale. Pick which elements to show and place it in any corner.
 - **Global hotkey** — configurable system-wide shortcut (default `F11`) to
@@ -31,7 +36,7 @@ cyberpunk UI built with Tauri + Rust and a Vite/TypeScript frontend.
   profiles (persisted to disk).
 - **Layer management** — install, update and uninstall the bundled Vulkan layer
   from Settings, with out-of-date detection.
-- **Cross-platform shell** — Windows and Linux via Tauri 2.
+- **Shell** — Linux desktop app via Tauri 2 (Vulkan layer is Linux-only).
 
 ## Tech stack
 
@@ -186,11 +191,10 @@ src-tauri/tauri.linux.conf.json  # bundles the layer as a Linux resource
 ### How upscaling is applied (design)
 
 1. **Detect** the target game process and its graphics API.
-2. **Attach** an interception layer to the swapchain / present path:
-   - Windows: DXGI / Vulkan layer hooks.
-   - Linux: a Vulkan implicit layer (works with Proton/DXVK) or gamescope.
-3. **Upscale** the backbuffer with FSR (or DLSS where supported).
-4. **Generate** interpolated frames when enabled.
+2. **Attach** the Vulkan implicit layer to the game's swapchain / present path
+   (Linux only; there is no Windows DXGI hook).
+3. **Upscale** the backbuffer with FSR (DLSS is not supported).
+4. No frame generation: interpolated frames are never synthesized.
 5. **Overlay** a render pass on top with stats and toggles.
 
 ## Roadmap

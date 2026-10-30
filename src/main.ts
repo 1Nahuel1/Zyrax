@@ -10,6 +10,7 @@ import {
   type Profile,
   type RuntimeStatus,
 } from "./api";
+import { escapeHtml, escapeAttr, normalizeExe, profileMatchesGame } from "./lib";
 
 type View = "dashboard" | "upscaling" | "framegen" | "overlay" | "profiles" | "settings";
 
@@ -145,8 +146,8 @@ function renderDashboard(): string {
       <div class="flex items-start justify-between">
         <div>
           <div class="text-xs text-cyber-neon/70 mb-1">GPU DETECTED</div>
-          <div class="text-lg text-white">${gpu.name}</div>
-          <div class="text-xs text-gray-400 mt-1">${gpu.vendor} · driver: ${gpu.driver}${
+          <div class="text-lg text-white">${escapeHtml(gpu.name)}</div>
+          <div class="text-xs text-gray-400 mt-1">${escapeHtml(gpu.vendor)} · driver: ${escapeHtml(gpu.driver)}${
         gpu.vramMb ? ` · ${gpu.vramMb} MB VRAM` : ""
       }</div>
         </div>
@@ -154,7 +155,9 @@ function renderDashboard(): string {
           ${gpu.apiSupport
             .map(
               (a) =>
-                `<span class="px-1.5 py-0.5 text-[10px] border border-cyber-cyan/40 text-cyber-cyan">${a}</span>`
+                `<span class="px-1.5 py-0.5 text-[10px] border border-cyber-cyan/40 text-cyber-cyan">${escapeHtml(
+                  a
+                )}</span>`
             )
             .join("")}
         </div>
@@ -176,13 +179,15 @@ function renderDashboard(): string {
           ${hookBadge()}
         </div>
         <div class="text-lg text-white">${
-          state.runtime.gameName ?? "NO GAME ATTACHED"
+          escapeHtml(state.runtime.gameName ?? "NO GAME ATTACHED")
         }</div>
-        <div class="text-xs text-gray-400 mt-1">${state.runtime.message}</div>
+        <div class="text-xs text-gray-400 mt-1">${escapeHtml(state.runtime.message)}</div>
         ${
           attached
             ? `<div class="mt-3 text-xs text-cyber-cyan/80">
-                UPSCALER: <span class="text-cyber-cyan">${(state.runtime.upscaler ?? "off").toUpperCase()}</span>
+                UPSCALER: <span class="text-cyber-cyan">${escapeHtml(
+                  (state.runtime.upscaler ?? "off").toUpperCase()
+                )}</span>
                 · FRAMEGEN: <span class="${state.runtime.frameGeneration ? "text-cyber-green" : "text-gray-500"}">${
                 state.runtime.frameGeneration ? "ON" : "OFF"
               }</span>
@@ -218,10 +223,12 @@ function renderDashboard(): string {
                     : "border-white/5 hover:border-cyber-cyan/30"
                 } transition-all">
                   <div class="min-w-0">
-                    <div class="text-sm text-white truncate">${g.name}</div>
+                    <div class="text-sm text-white truncate">${escapeHtml(
+                      g.name
+                    )}</div>
                     <div class="text-[10px] text-gray-500 truncate">pid ${g.pid} · ${
-                      g.source
-                    }${g.launcher ? ` · ${g.launcher}` : ""}</div>
+                      escapeHtml(g.source)
+                    }${g.launcher ? ` · ${escapeHtml(g.launcher)}` : ""}</div>
                   </div>
                   <button data-action="select-game" data-pid="${g.pid}" class="ml-3 px-3 py-1 text-xs border ${
                     state.selectedPid === g.pid
@@ -239,14 +246,21 @@ function renderDashboard(): string {
       <div class="text-sm text-cyber-orange mb-3">[ ACTIVE PROFILE ]</div>
       <div class="flex items-center justify-between">
         <div>
-          <div class="text-lg text-white">${active ? active.name : "NONE"}</div>
+          <div class="text-lg text-white">${active ? escapeHtml(active.name) : "NONE"}</div>
           <div class="text-xs text-gray-400">${
             active
-              ? `Upscaler: ${active.upscaler.toUpperCase()} · x${active.scaleFactor} · FrameGen: ${
+              ? `Upscaler: ${escapeHtml(active.upscaler.toUpperCase())} · x${active.scaleFactor} · FrameGen: ${
                   active.frameGeneration ? "ON" : "OFF"
                 }`
               : "Create a profile to get started"
           }</div>
+          ${
+            active?.gameExe
+              ? `<div class="text-[10px] text-cyber-cyan/80 mt-1">BOUND TO: ${escapeHtml(
+                  active.gameExe
+                )}</div>`
+              : ""
+          }
         </div>
         <button data-action="apply" class="px-4 py-2 border border-cyber-green/50 text-cyber-green hover:bg-cyber-green/10 text-sm transition-all ${
           state.selectedPid === null ? "opacity-40 pointer-events-none" : ""
@@ -270,18 +284,10 @@ function renderUpscaling(): string {
     {
       id: "fsr",
       label: "FSR",
-      desc: "AMD FidelityFX Super Resolution",
+      desc: "AMD FidelityFX Super Resolution (solo backend implementado)",
       active: "border-cyber-neon/70 bg-cyber-neon/10 shadow-neon-cyan",
       idle: "border-white/10 hover:border-cyber-neon/40",
       title: "text-cyber-neon",
-    },
-    {
-      id: "dlss",
-      label: "DLSS",
-      desc: "NVIDIA Deep Learning Super Sampling",
-      active: "border-cyber-magenta/70 bg-cyber-magenta/10 shadow-neon-magenta",
-      idle: "border-white/10 hover:border-cyber-magenta/40",
-      title: "text-cyber-magenta",
     },
   ];
   return `
@@ -348,39 +354,27 @@ function renderFramegen(): string {
         ? `<div class="text-sm text-gray-500">Create a profile first.</div>`
         : `
       <div class="text-[11px] text-cyber-orange border border-cyber-orange/30 bg-cyber-orange/5 px-3 py-2 mb-3">
-        The Linux Vulkan layer does not synthesize frames yet; profiles only store this preference.
+        Frame generation is not implemented; attached with FSR only. This preference is stored but never applied.
       </div>
-      <div class="bg-cyber-panel/60 border border-cyber-magenta/40 p-5 mb-4">
+      <div class="bg-cyber-panel/60 border border-cyber-magenta/40 p-5 mb-4 opacity-50 pointer-events-none">
         <div class="flex items-center justify-between">
           <div>
             <div class="text-sm text-white">ENABLE FRAME GENERATION</div>
             <div class="text-xs text-gray-400 mt-1">Interpolates synthetic frames between rendered frames.</div>
           </div>
-          <button data-action="toggle-framegen" class="w-14 h-7 border ${
-            p.frameGeneration
-              ? "border-cyber-green/60 bg-cyber-green/20"
-              : "border-gray-600 bg-transparent"
-          } relative transition-all">
-            <span class="absolute top-0.5 ${
-              p.frameGeneration ? "left-7 bg-cyber-green" : "left-0.5 bg-gray-500"
-            } w-6 h-6 transition-all"></span>
+          <button class="w-14 h-7 border border-gray-600 bg-transparent relative transition-all disabled">
+            <span class="absolute top-0.5 left-0.5 bg-gray-500 w-6 h-6"></span>
           </button>
         </div>
       </div>
 
-      <div class="bg-cyber-panel/60 border border-cyber-pink/30 p-5 ${
-        p.frameGeneration ? "" : "opacity-40 pointer-events-none"
-      }">
+      <div class="bg-cyber-panel/60 border border-cyber-pink/30 p-5 opacity-50 pointer-events-none">
         <div class="text-sm text-cyber-pink mb-3">MULTIPLIER</div>
         <div class="grid grid-cols-3 gap-3">
           ${[2, 3, 4]
             .map(
               (m) => `
-            <button data-action="set-multiplier" data-value="${m}" class="py-3 border transition-all ${
-              p.frameGenMultiplier === m
-                ? "border-cyber-magenta text-cyber-magenta bg-cyber-magenta/10 shadow-neon-magenta"
-                : "border-white/10 text-gray-400 hover:border-cyber-magenta/40"
-            }">
+            <button class="py-3 border border-white/10 text-gray-400 disabled">
               <div class="text-xl font-bold">${m}x</div>
               <div class="text-[10px] mt-1">${m === 2 ? "Balanced" : m === 3 ? "Aggressive" : "Extreme"}</div>
             </button>`
@@ -469,7 +463,7 @@ function renderOverlay(): string {
       <div class="bg-cyber-panel/60 border border-cyber-cyan/30 p-5">
         <div class="text-sm text-cyber-cyan mb-3">TOGGLE HOTKEY</div>
         <div class="flex items-center gap-3">
-          <input data-action="hotkey" value="${p.hotkeyToggle}" maxlength="32"
+          <input data-action="hotkey" value="${escapeAttr(p.hotkeyToggle)}" maxlength="32"
             class="bg-black/40 border border-cyber-cyan/40 text-cyber-cyan px-3 py-2 text-sm w-48 outline-none focus:border-cyber-cyan" />
           <span class="text-[11px] text-gray-500">Global shortcut. Examples: F11, Ctrl+Shift+Z.</span>
         </div>
@@ -502,7 +496,7 @@ function renderProfiles(): string {
               }">
                 <div class="min-w-0">
                   <div class="flex items-center gap-2">
-                    <span class="text-sm text-white">${p.name}</span>
+                    <span class="text-sm text-white">${escapeHtml(p.name)}</span>
                     ${
                       p.id === state.activeProfileId
                         ? `<span class="text-[9px] px-1.5 py-0.5 border border-cyber-neon/50 text-cyber-neon">ACTIVE</span>`
@@ -510,14 +504,26 @@ function renderProfiles(): string {
                     }
                   </div>
                   <div class="text-[10px] text-gray-500 mt-0.5">
-                    ${p.upscaler.toUpperCase()} x${p.scaleFactor} · FrameGen ${p.frameGeneration ? "ON" : "OFF"} · Overlay ${
+                    ${escapeHtml(p.upscaler.toUpperCase())} x${p.scaleFactor} · FrameGen ${p.frameGeneration ? "ON" : "OFF"} · Overlay ${
                   p.overlayEnabled ? "ON" : "OFF"
                 }
                   </div>
+                  ${
+                    p.gameExe
+                      ? `<div class="text-[10px] text-cyber-cyan/80 mt-0.5">BOUND TO: ${escapeHtml(
+                          p.gameExe
+                        )}</div>`
+                      : ""
+                  }
                 </div>
                 <div class="flex gap-2 shrink-0">
-                  <button data-action="activate-profile" data-id="${p.id}" class="px-2 py-1 text-[11px] border border-cyber-cyan/40 text-cyber-cyan hover:bg-cyber-cyan/10">ACTIVATE</button>
-                  <button data-action="delete-profile" data-id="${p.id}" class="px-2 py-1 text-[11px] border border-cyber-pink/40 text-cyber-pink hover:bg-cyber-pink/10">DEL</button>
+                  ${
+                    p.gameExe
+                      ? `<button data-action="clear-game-binding" data-id="${escapeAttr(p.id)}" class="px-2 py-1 text-[11px] border border-cyber-orange/40 text-cyber-orange hover:bg-cyber-orange/10">CLEAR GAME BINDING</button>`
+                      : ""
+                  }
+                  <button data-action="activate-profile" data-id="${escapeAttr(p.id)}" class="px-2 py-1 text-[11px] border border-cyber-cyan/40 text-cyber-cyan hover:bg-cyber-cyan/10">ACTIVATE</button>
+                  <button data-action="delete-profile" data-id="${escapeAttr(p.id)}" class="px-2 py-1 text-[11px] border border-cyber-pink/40 text-cyber-pink hover:bg-cyber-pink/10">DEL</button>
                 </div>
               </div>`
               )
@@ -570,9 +576,11 @@ function renderLayerCard(): string {
        </div>`
     : '<div class="mt-3 text-xs text-gray-500">No active attachment. Launch a Vulkan game, then attach it from the dashboard.</div>';
 
-  const paths = layer.sourceDir
-    ? `<div class="mt-2 text-[11px] text-gray-500 break-all">${layer.sourceDir}</div>`
-    : "";
+    const paths = layer.sourceDir
+      ? `<div class="mt-2 text-[11px] text-gray-500 break-all">${escapeHtml(
+          layer.sourceDir
+        )}</div>`
+      : "";
 
   const installBtn = layer.installed && layer.updateAvailable
     ? '<button data-action="update-layer" class="px-3 py-1 border border-cyber-magenta/50 text-cyber-magenta text-xs hover:bg-cyber-magenta/10 hover:shadow-neon-magenta transition-all">UPDATE SYSTEM-WIDE</button>'
@@ -585,7 +593,7 @@ function renderLayerCard(): string {
 
   return shell(`
       <div class="flex items-center justify-between mb-2">
-        <div class="text-xs text-gray-400">${layer.message}</div>
+        <div class="text-xs text-gray-400">${escapeHtml(layer.message)}</div>
         <div class="text-xs font-bold shrink-0 ml-3">${badge}</div>
       </div>
       ${paths}
@@ -613,7 +621,7 @@ function renderSettings(): string {
       <div class="bg-cyber-panel/60 border border-white/10 p-4">
         <div class="text-sm text-cyber-cyan mb-2">SYSTEM INFO</div>
         <div class="text-xs text-gray-400 space-y-1">
-          <div>Platform: ${navigator.platform || "unknown"}</div>
+          <div>Platform: ${escapeHtml(navigator.platform || "unknown")}</div>
           <div>GPUs detected: ${state.gpus.length}</div>
           <div>Profiles: ${state.profiles.length}</div>
           <div>Hook state: ${state.runtime.state.toUpperCase()}</div>
@@ -677,7 +685,9 @@ function render(): void {
 
     ${
       state.toast
-        ? `<div class="absolute bottom-4 right-4 max-w-sm bg-cyber-panel border border-cyber-green/50 text-cyber-green text-xs px-4 py-2 shadow-[0_0_20px_#00ff8855]">${state.toast}</div>`
+        ? `<div class="absolute bottom-4 right-4 max-w-sm bg-cyber-panel border border-cyber-green/50 text-cyber-green text-xs px-4 py-2 shadow-[0_0_20px_#00ff8855]">${escapeHtml(
+            state.toast
+          )}</div>`
         : ""
     }
   </div>
@@ -726,7 +736,7 @@ async function syncRuntimeProfile(): Promise<void> {
       upscaler: p.upscaler,
       scaleFactor: p.scaleFactor,
       sharpness: p.sharpness,
-      frameGeneration: p.frameGeneration,
+      frameGeneration: false,
       overlayEnabled: p.overlayEnabled,
       overlayShowFps: p.overlayShowFps,
       overlayShowScale: p.overlayShowScale,
@@ -768,11 +778,38 @@ async function handleAction(el: HTMLElement): Promise<void> {
       render();
       try {
         state.games = await api.scanGames();
-        toast(
-          state.games.length > 0
-            ? `Found ${state.games.length} game process(es)`
-            : "No games detected"
+        if (!state.games.some((g) => g.pid === state.selectedPid)) {
+          state.selectedPid = null;
+        }
+        const matches = state.games.flatMap((game) =>
+          state.profiles
+            .filter((profile) => profileMatchesGame(profile, game))
+            .map((profile) => ({ game, profile }))
         );
+        const preferred =
+          matches.find((m) => m.profile.id === state.activeProfileId) ?? matches[0];
+        if (preferred) {
+          if (state.activeProfileId !== preferred.profile.id) {
+            try {
+              const data = await api.setActiveProfile(preferred.profile.id);
+              state.profiles = data.profiles;
+              state.activeProfileId = data.activeProfileId;
+              await api.setGlobalHotkey(preferred.profile.hotkeyToggle);
+            } catch (e) {
+              console.warn("auto-select profile:", e);
+            }
+          }
+          state.selectedPid = preferred.game.pid;
+          toast(
+            `Found ${state.games.length} game process(es); selected "${preferred.profile.name}" for ${preferred.game.name}`
+          );
+        } else {
+          toast(
+            state.games.length > 0
+              ? `Found ${state.games.length} game process(es)`
+              : "No games detected"
+          );
+        }
       } catch (e) {
         toast(`Scan failed: ${e}`);
       } finally {
@@ -805,14 +842,24 @@ async function handleAction(el: HTMLElement): Promise<void> {
           upscaler: p.upscaler,
           scaleFactor: p.scaleFactor,
           sharpness: p.sharpness,
-          frameGeneration: p.frameGeneration,
+          frameGeneration: false,
           overlayEnabled: p.overlayEnabled,
           overlayShowFps: p.overlayShowFps,
           overlayShowScale: p.overlayShowScale,
           overlayPosition: p.overlayPosition,
         });
-        if (state.runtime.state === "failed") toast(state.runtime.message);
-        else toast(`Applied to ${game.name}`);
+        if (state.runtime.state === "failed") {
+          toast(state.runtime.message);
+          break;
+        }
+        const boundExe = normalizeExe(game.exe);
+        if (p.gameExe !== (boundExe || null)) {
+          p.gameExe = boundExe || null;
+          const data = await api.saveProfile(p);
+          state.profiles = data.profiles;
+          state.activeProfileId = data.activeProfileId;
+        }
+        toast(`Applied to ${game.name}`);
       } catch (e) {
         toast(`Attach failed: ${e}`);
       }
@@ -820,6 +867,10 @@ async function handleAction(el: HTMLElement): Promise<void> {
     }
     case "set-upscaler": {
       const value = el.dataset.value!;
+      if (value !== "off" && value !== "fsr") {
+        toast("Only FSR and OFF are implemented.");
+        break;
+      }
       await persistActive((p) => (p.upscaler = value));
       toast(`Upscaler set to ${value.toUpperCase()}`);
       break;
@@ -913,6 +964,18 @@ async function handleAction(el: HTMLElement): Promise<void> {
       }
       scheduleRuntimeSync();
       toast("Profile activated");
+      break;
+    }
+    case "clear-game-binding": {
+      const id = el.dataset.id!;
+      const profile = state.profiles.find((p) => p.id === id);
+      if (!profile) break;
+      profile.gameExe = null;
+      const data = await api.saveProfile(profile);
+      state.profiles = data.profiles;
+      state.activeProfileId = data.activeProfileId;
+      render();
+      toast("Game binding cleared");
       break;
     }
     case "delete-profile": {

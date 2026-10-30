@@ -1,3 +1,4 @@
+export type HookState = "idle" | "active" | "hooked" | "failed" | "error";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface RunningProcess {
@@ -75,7 +76,18 @@ export interface LayerStatus {
   message: string;
 }
 
-export type HookState = "idle" | "attaching" | "active" | "failed";
+export interface AttachRequest {
+  pid: number;
+  gameName: string;
+  upscaler: string;
+  scaleFactor: number;
+  sharpness: number;
+  frameGeneration: boolean;
+  overlayEnabled: boolean;
+  overlayShowFps: boolean;
+  overlayShowScale: boolean;
+  overlayPosition: string;
+}
 
 export interface RuntimeStatus {
   state: HookState;
@@ -108,18 +120,8 @@ export const api = {
   uninstallLayer: () => invoke<LayerStatus>("uninstall_layer"),
   setGlobalHotkey: (accelerator: string) =>
     invoke<void>("set_global_hotkey", { accelerator }),
-  attachToGame: (args: {
-    pid: number;
-    gameName: string;
-    upscaler: string;
-    scaleFactor: number;
-    sharpness: number;
-    frameGeneration: boolean;
-    overlayEnabled: boolean;
-    overlayShowFps: boolean;
-    overlayShowScale: boolean;
-    overlayPosition: string;
-  }) => invoke<RuntimeStatus>("attach_to_game", args),
+  attachToGame: (args: AttachRequest) =>
+    invoke<RuntimeStatus>("attach_to_game", { request: args }),
   detachFromGame: () => invoke<RuntimeStatus>("detach_from_game"),
   setOverlayEnabled: (enabled: boolean) =>
     invoke<RuntimeStatus>("set_overlay_enabled", { enabled }),

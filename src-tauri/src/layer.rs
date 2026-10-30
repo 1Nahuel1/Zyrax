@@ -168,43 +168,39 @@ fn control_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/zyrax_fsr_control"))
 }
 
+/// Control file payload consumed by the Vulkan layer.
+#[derive(Debug, Clone)]
+pub struct LayerControl {
+    pub pid: u32,
+    pub enabled: bool,
+    pub scale_factor: f32,
+    pub sharpness: f32,
+    pub overlay: bool,
+    pub overlay_show_fps: bool,
+    pub overlay_show_scale: bool,
+    pub overlay_position: String,
+    pub frame_generation: bool,
+}
+
 /// Write the control file consumed by the Vulkan layer. The layer polls this
 /// file and activates only for the matching PID, so attaching works for a game
 /// that is already running.
-pub fn write_layer_control(
-    pid: u32,
-    enabled: bool,
-    scale_factor: f32,
-    sharpness: f32,
-    overlay: bool,
-    overlay_show_fps: bool,
-    overlay_show_scale: bool,
-    overlay_position: &str,
-    frame_generation: bool,
-) -> Result<(), String> {
+pub fn write_layer_control(control: &LayerControl) -> Result<(), String> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (
-            pid,
-            enabled,
-            scale_factor,
-            sharpness,
-            overlay,
-            overlay_show_fps,
-            overlay_show_scale,
-            overlay_position,
-            frame_generation,
+        let _ = control;
+        return Err(
+            "The DXGI hook is not implemented; the Zyrax Vulkan layer is Linux-only.".to_string(),
         );
-        return Err("The Vulkan layer is only available on Linux".to_string());
     }
 
     #[cfg(target_os = "linux")]
     {
         let path = control_path();
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        let scale = scale_factor.clamp(1.0, 4.0);
-        let sharp = sharpness.clamp(0.0, 1.0);
-        let position = match overlay_position.to_ascii_lowercase().as_str() {
+        let scale = control.scale_factor.clamp(1.0, 4.0);
+        let sharp = control.sharpness.clamp(0.0, 1.0);
+        let position = match control.overlay_position.to_ascii_lowercase().as_str() {
             "top-left" => 1,
             "bottom-right" => 2,
             "top-right" => 3,
@@ -212,15 +208,15 @@ pub fn write_layer_control(
         };
         let body = format!(
             "version=1\nenabled={}\npid={}\nscale={:.4}\nsharpness={:.4}\noverlay={}\noverlay_fps={}\noverlay_scale={}\noverlay_pos={}\nframe_gen={}\n",
-            enabled as u8,
-            pid,
+            control.enabled as u8,
+            control.pid,
             scale,
             sharp,
-            overlay as u8,
-            overlay_show_fps as u8,
-            overlay_show_scale as u8,
+            control.overlay as u8,
+            control.overlay_show_fps as u8,
+            control.overlay_show_scale as u8,
             position,
-            frame_generation as u8
+            control.frame_generation as u8
         );
         fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
         fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
@@ -371,17 +367,17 @@ mod tests {
         let path = dir.join("control");
         std::env::set_var("ZYRAX_FSR_CONTROL", &path);
 
-        write_layer_control(
-            4242,
-            true,
-            1.75,
-            0.65,
-            true,
-            true,
-            false,
-            "top-right",
-            false,
-        )
+        write_layer_control(&LayerControl {
+            pid: 4242,
+            enabled: true,
+            scale_factor: 1.75,
+            sharpness: 0.65,
+            overlay: true,
+            overlay_show_fps: true,
+            overlay_show_scale: false,
+            overlay_position: "top-right".into(),
+            frame_generation: false,
+        })
         .unwrap();
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("enabled=1"));
@@ -394,17 +390,17 @@ mod tests {
         assert!(body.contains("overlay_pos=3"));
         assert!(body.contains("frame_gen=0"));
 
-        write_layer_control(
-            4242,
-            false,
-            1.0,
-            0.0,
-            false,
-            true,
-            true,
-            "bottom-left",
-            false,
-        )
+        write_layer_control(&LayerControl {
+            pid: 4242,
+            enabled: false,
+            scale_factor: 1.0,
+            sharpness: 0.0,
+            overlay: false,
+            overlay_show_fps: true,
+            overlay_show_scale: true,
+            overlay_position: "bottom-left".into(),
+            frame_generation: false,
+        })
         .unwrap();
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("enabled=0"));

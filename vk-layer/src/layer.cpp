@@ -113,7 +113,9 @@ struct PushConstants {
     uint32_t con3[4];
     uint32_t rcas[4];
     uint32_t ui[4];
+    uint32_t ui2[4];
 };
+static_assert(sizeof(PushConstants) == 112, "PushConstants must match the shader layout (7 x uvec4)");
 
 struct QueueState {
     uint32_t family = 0;
@@ -278,6 +280,9 @@ struct ControlState {
     float sharpness = 0.5f;
     bool overlay = false;
     bool frameGen = false;
+    bool overlayFps = true;
+    bool overlayScale = true;
+    uint32_t overlayPos = 0;
     uint64_t serial = 0;
     double lastRead = -1.0;
 };
@@ -326,6 +331,9 @@ static void refreshControl() {
             else if (!strcmp(key, "scale")) c.scale = (float)atof(value);
             else if (!strcmp(key, "sharpness")) c.sharpness = (float)atof(value);
             else if (!strcmp(key, "overlay")) c.overlay = atoi(value) != 0;
+            else if (!strcmp(key, "overlay_fps")) c.overlayFps = atoi(value) != 0;
+            else if (!strcmp(key, "overlay_scale")) c.overlayScale = atoi(value) != 0;
+            else if (!strcmp(key, "overlay_pos")) c.overlayPos = (uint32_t)std::clamp(atoi(value), 0, 3);
             else if (!strcmp(key, "frame_gen")) c.frameGen = atoi(value) != 0;
         }
         fclose(f);
@@ -339,7 +347,10 @@ static void refreshControl() {
                            fabsf(c.scale - g_control.scale) > 1e-4f ||
                            fabsf(c.sharpness - g_control.sharpness) > 1e-4f;
     bool anyChanged = pipelineChanged || c.overlay != g_control.overlay ||
-                      c.frameGen != g_control.frameGen;
+                      c.frameGen != g_control.frameGen ||
+                      c.overlayFps != g_control.overlayFps ||
+                      c.overlayScale != g_control.overlayScale ||
+                      c.overlayPos != g_control.overlayPos;
     if (pipelineChanged) ++c.serial;
     if (anyChanged) {
         g_control = c;
@@ -389,6 +400,22 @@ static bool overlayEnabled() {
     const char* e = getenv("ZYRAX_FSR_OVERLAY");
     if (e && e[0] == '1') return true;
     return snapshotControl().overlay;
+}
+
+static bool overlayShowFps() {
+    const char* e = getenv("ZYRAX_FSR_OVERLAY_FPS");
+    if (e && e[0]) return atoi(e) != 0;
+    return snapshotControl().overlayFps;
+}
+static bool overlayShowScale() {
+    const char* e = getenv("ZYRAX_FSR_OVERLAY_SCALE");
+    if (e && e[0]) return atoi(e) != 0;
+    return snapshotControl().overlayScale;
+}
+static uint32_t overlayPosition() {
+    const char* e = getenv("ZYRAX_FSR_OVERLAY_POS");
+    if (e && e[0]) return (uint32_t)std::clamp(atoi(e), 0, 3);
+    return snapshotControl().overlayPos;
 }
 
 // ---------------------------------------------------------------------------
@@ -870,10 +897,19 @@ static void processFrame(DeviceState* ds, SwapchainState* sc, VkQueue queue, uin
     QueueState* qs = ensureQueue(ds, queue);
     if (!qs) return;
 
+    bool showFps = overlayShowFps();
+    bool showScale = overlayShowScale();
+    uint32_t pos = overlayPosition();
+    uint32_t flags = (showFps ? 1u : 0u) | (showScale ? 2u : 0u) | ((pos & 3u) << 2u);
+
     sc->pc.ui[0] = overlayEnabled() ? 1u : 0u;
     sc->pc.ui[1] = (uint32_t)(ds->fps + 0.5f);
     sc->pc.ui[2] = (uint32_t)(readScale() * 100.0f + 0.5f);
-    sc->pc.ui[3] = sc->extent.height;
+    sc->pc.ui[3] = flags;
+    sc->pc.ui2[0] = sc->extent.width;
+    sc->pc.ui2[1] = sc->extent.height;
+    sc->pc.ui2[2] = 0;
+    sc->pc.ui2[3] = 0;
 
     VkImage swImg = sc->images[index];
     VkFramebuffer fb = sc->framebuffers[index];

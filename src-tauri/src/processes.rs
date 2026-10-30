@@ -67,7 +67,7 @@ pub fn list_processes() -> Vec<RunningProcess> {
         })
         .collect();
 
-    processes.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
+    processes.sort_by_key(|p| std::cmp::Reverse(p.memory_mb));
     processes.truncate(200);
     processes
 }

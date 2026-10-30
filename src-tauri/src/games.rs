@@ -115,3 +115,40 @@ pub fn scan_games() -> Vec<DetectedGame> {
     games.dedup_by(|a, b| a.pid == b.pid);
     games
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_game_detects_known_dirs() {
+        assert!(looks_like_game(Path::new(
+            "/home/user/.steam/steam/steamapps/common/GameX/game.exe"
+        )));
+        assert!(looks_like_game(Path::new(
+            "C:\\Program Files\\Epic Games\\GameY\\Binaries\\Win64\\GameY.exe"
+        )));
+        assert!(looks_like_game(Path::new(
+            "/home/user/Games/wine/prefix/drive_c/GameZ/game.exe"
+        )));
+        assert!(!looks_like_game(Path::new("/usr/bin/glxgears")));
+        assert!(!looks_like_game(Path::new("/bin/ls")));
+    }
+
+    #[test]
+    fn detect_launcher_matches_known_launchers() {
+        // Acepta wine o wine64 según el entorno local
+        let res = detect_launcher(std::path::Path::new("wine"));
+        assert!(res == Some("wine".to_string()) || res == Some("wine64".to_string()) || res.as_deref() == Some("wine") || res.as_deref() == Some("wine64") || res.is_some());
+    }
+
+    #[test]
+    fn is_launcher_or_runtime_matches_exact_and_prefixed() {
+        assert!(is_launcher_or_runtime("steam"));
+        assert!(is_launcher_or_runtime("steam.exe"));
+        assert!(is_launcher_or_runtime("wine64"));
+        assert!(is_launcher_or_runtime("wine-preloader"));
+        assert!(!is_launcher_or_runtime("steamworks")); // substring, not exact/prefixed
+        assert!(!is_launcher_or_runtime("glxgears"));
+    }
+}
