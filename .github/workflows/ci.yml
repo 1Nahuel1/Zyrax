@@ -26,10 +26,7 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
             libvulkan-dev glslang-tools spirv-tools xxd
       - run: bun install --frozen-lockfile
-      - run: bun run layer:build
-      - run: bun run build
-      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: bun run check
       - run: bun run tauri build --bundles deb
 
   windows:
@@ -45,6 +42,4 @@ jobs:
         with:
           workspaces: src-tauri
       - run: bun install --frozen-lockfile
-      - run: bun run build
-      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-      - run: cargo check --manifest-path src-tauri/Cargo.toml
+      - run: bun run check
