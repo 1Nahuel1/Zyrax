@@ -6,7 +6,8 @@
 ![license](https://img.shields.io/badge/license-MIT-00fff9)
 ![platform](https://img.shields.io/badge/platform-Linux-ff00ff)
 
-Zyrax is an open-source desktop app that detects your running games, lets you
+Zyrax es una aplicación de escritorio de código abierto construida con Rust y Tauri, diseñada como un overlay de reescalado y optimización para Linux (inspirada en Lossless Scaling). Permite la detección automática de juegos en ejecución y la configuración de reescalado espacial (AMD FSR) para mejorar la experiencia de juego en entornos de código abierto.
+
 configure spatial upscaling (AMD **FSR**), and shows a neon **in-game overlay**
 — all wrapped in a cyberpunk UI built with Tauri + Rust and a Vite/TypeScript
 frontend.
