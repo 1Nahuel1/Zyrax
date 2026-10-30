@@ -27,7 +27,6 @@ jobs:
             libvulkan-dev glslang-tools spirv-tools xxd
       - run: bun install --frozen-lockfile
       - run: bun run check
-      - run: bun run tauri build --bundles deb
 
   windows:
     name: Windows compile
